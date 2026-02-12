@@ -21,7 +21,7 @@ class ConjugateGradientMAPBayesianRegression:
 
     Solves, for a fixed iteration budget T (`maxiter`):
 
-        (X^T X + Sigma^{-1}) w = X^T y + Sigma^{-1} m0
+        (X^T X + V Sigma^{-1}) w = X^T y + V Sigma^{-1} m0
 
     Notes
     -----
@@ -66,13 +66,30 @@ class ConjugateGradientMAPBayesianRegression:
         y: np.ndarray,
         m0: np.ndarray,
         Sigma: np.ndarray,
+        V: float,
     ) -> np.ndarray:
-        X, y, m0, Sigma = self._validate_and_prepare_inputs(X, y, m0, Sigma)
+        """
+        Fit CG/PCG baseline on the MAP linear system and return a normalized state vector.
+
+        Parameters
+        ----------
+        X : ndarray, shape (N, D)
+            Training matrix.
+        y : ndarray, shape (N,) or (N, 1)
+            Targets.
+        m0 : ndarray, shape (D,) or (D, 1)
+            Prior mean.
+        Sigma : ndarray, shape (D,) or (D, D)
+            Prior covariance.
+        V : float
+            Prior-strength scaling in the MAP objective.
+        """
+        X, y, m0, Sigma, V = self._validate_and_prepare_inputs(X, y, m0, Sigma, V)
         n_features = X.shape[1]
 
         precision = self._precision_from_covariance(Sigma)
-        A = X.T @ X + precision
-        b = X.T @ y + precision @ m0
+        A = X.T @ X + V * precision
+        b = X.T @ y + V * (precision @ m0)
 
         w0 = self._make_initial_point(n_features)
         w_map, history = self._run_cg(A, b, w0)
@@ -123,7 +140,8 @@ class ConjugateGradientMAPBayesianRegression:
         y: np.ndarray,
         m0: np.ndarray,
         Sigma: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        V: float,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float).reshape(-1)
         m0 = np.asarray(m0, dtype=float).reshape(-1)
@@ -161,7 +179,11 @@ class ConjugateGradientMAPBayesianRegression:
         else:
             raise ValueError("Sigma must be either a 1D diagonal vector or a 2D matrix.")
 
-        return X, y, m0, Sigma
+        V = float(V)
+        if V < 0.0:
+            raise ValueError("V must be non-negative.")
+
+        return X, y, m0, Sigma, V
 
     def _make_initial_point(self, n_features: int) -> np.ndarray:
         if self.initial_point is None:
@@ -310,6 +332,7 @@ def conjugate_gradient_map_solution(
     y: np.ndarray,
     m0: np.ndarray,
     Sigma: np.ndarray,
+    V: float,
     maxiter: int = 100,
     preconditioner: str = "none",
     eps: float = 1e-12,
@@ -321,7 +344,7 @@ def conjugate_gradient_map_solution(
         eps=eps,
         initial_point=initial_point,
     )
-    model.fit(X, y, m0, Sigma)
+    model.fit(X, y, m0, Sigma, V=V)
     return model.get_weights(), model.get_relative_residual()
 
 

@@ -199,6 +199,22 @@ def print_training_logs(
         print(f"    iter {i:>4}/{losses.size:<4} | loss={float(loss):.6f}")
 
 
+def make_realtime_training_logger(
+    shots: int,
+    maxiter: int,
+    log_every_iter: int,
+):
+    if log_every_iter <= 0:
+        raise ValueError("log_every_iter must be positive.")
+
+    def _callback(iteration: int, snapshot) -> None:
+        if iteration != 1 and iteration != maxiter and (iteration % log_every_iter != 0):
+            return
+        print(f"    iter {iteration:>4}/{maxiter:<4} | loss={float(snapshot.L_tilde):.6f}", flush=True)
+
+    return _callback
+
+
 def run_experiment(args: argparse.Namespace) -> None:
     X, y, m0, Sigma, true_w = make_synthetic_dataset(
         n_samples=args.n_samples,
@@ -234,17 +250,19 @@ def run_experiment(args: argparse.Namespace) -> None:
             verbose=args.verbose,
         )
 
-        quantum_state = model.fit(X, y, m0, Sigma, V=args.V)
+        iteration_callback = None
+        if args.log_training:
+            print(f"  Training log (shots={_shot_label(shots)}):")
+            iteration_callback = make_realtime_training_logger(
+                shots=shots,
+                maxiter=args.maxiter,
+                log_every_iter=args.log_every_iter,
+            )
+
+        quantum_state = model.fit(X, y, m0, Sigma, V=args.V, iteration_callback=iteration_callback)
         metrics = compare_quantum_to_closed_form(quantum_state, w_star, n_features=X.shape[1])
         losses = np.array([snap.L_tilde for snap in model.history_], dtype=float)
         runs.append(ShotRunResult(shots=shots, losses=losses, metrics=metrics))
-
-        if args.log_training:
-            print_training_logs(
-                losses=losses,
-                shots=shots,
-                log_every_iter=args.log_every_iter,
-            )
 
         print(f"[shots={_shot_label(shots)}]")
         print(f"  Fidelity:             {metrics.fidelity:.6f}")
