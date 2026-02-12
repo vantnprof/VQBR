@@ -274,7 +274,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prior-var", type=float, default=1.0)
     parser.add_argument("--V", type=float, default=1e-3)
     parser.add_argument("--seed", type=int, default=2505)
-
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--reps", type=int, default=2)
     parser.add_argument("--optimizer", type=str, default="COBYLA")
