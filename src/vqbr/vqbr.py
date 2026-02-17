@@ -64,7 +64,6 @@ class VariationalQuantumBayesianRegression:
         maxiter: int = 100,
         epochs: Optional[int] = None,
         shuffle_batches: bool = True,
-        batch_optimizer_maxiter: int = 2,
         learning_rate: float = 0.05,
         spsa_perturbation: float = 0.1,
         su2_gates: Sequence[str] = ("ry",),
@@ -83,7 +82,6 @@ class VariationalQuantumBayesianRegression:
         self.maxiter = int(maxiter)
         self.epochs = epochs
         self.shuffle_batches = bool(shuffle_batches)
-        self.batch_optimizer_maxiter = int(batch_optimizer_maxiter)
         self.learning_rate = float(learning_rate)
         self.spsa_perturbation = float(spsa_perturbation)
         self.su2_gates = tuple(su2_gates)
@@ -157,7 +155,7 @@ class VariationalQuantumBayesianRegression:
             self._build_state_prep_gate(X[i], label=f"Ux_{i}") for i in range(n_samples)
         ]
 
-        c = precision_diag * m0
+        c = V * precision_diag * m0
         self._c_norm = float(np.linalg.norm(c))
         self._Uc_gate = None
         if self._c_norm > 0.0:
@@ -301,9 +299,7 @@ class VariationalQuantumBayesianRegression:
 
     def _use_stochastic_optimizer(self) -> bool:
         opt = self.optimizer.upper()
-        if opt in {"SPSA", "SGD", "ADAM"}:
-            return True
-        return bool(self.batch_size < self._n_samples or self.use_shot_noise)
+        return opt in {"SPSA", "SGD", "ADAM"}
 
     def _resolve_stochastic_optimizer(self) -> str:
         opt = self.optimizer.upper()
@@ -362,7 +358,7 @@ class VariationalQuantumBayesianRegression:
             x0=theta_init,
             method=self.optimizer,
             options=options,
-            tol=1e-12,
+            tol=1e-6,
         )
 
     def _fit_with_stochastic_optimizer(
@@ -639,8 +635,11 @@ class VariationalQuantumBayesianRegression:
         apply_shot_noise = self.use_shot_noise if use_shot_noise is None else bool(use_shot_noise)
         if apply_shot_noise:
             counts = self._rng.multinomial(self.shots, probs)
-            return float(np.dot(self._precision_diag_padded, counts) / float(self.shots))
-        return float(np.dot(self._precision_diag_padded, probs))
+            # now includes V inside
+            return float(self._V * np.dot(self._precision_diag_padded, counts) / float(self.shots))
+
+        # now includes V inside
+        return float(self._V * np.dot(self._precision_diag_padded, probs))
 
     def _objective_on_batch(
         self,
@@ -679,9 +678,11 @@ class VariationalQuantumBayesianRegression:
 
         d_hat = self._estimate_d_hat(theta_vec, use_shot_noise=use_shot_noise)
 
-        denom = a_hat + self._V * d_hat + self.eps
-        numerator = c_hat + self._V * e_hat
-        L_tilde = -((numerator**2) / denom)
+        denom = a_hat + d_hat + self.eps
+        numerator = c_hat + e_hat
+        # Stability transform: minimize log(denom) - 2*log(|numerator|),
+        # which is monotonic-equivalent to maximizing (numerator^2 / denom).
+        L_tilde = np.log(denom) - 2.0 * np.log(np.abs(numerator) + self.eps)
 
         return ObjectiveSnapshot(
             L_tilde=float(L_tilde),
