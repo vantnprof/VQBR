@@ -10,6 +10,10 @@ try:
     from qiskit import QuantumCircuit
     from qiskit.circuit.library import StatePreparation
     from qiskit.quantum_info import Statevector
+    try:
+        from qiskit_aer import AerSimulator
+    except Exception:
+        AerSimulator = None  # type: ignore[assignment]
 
     try:
         from qiskit.circuit.library import efficient_su2
@@ -25,6 +29,7 @@ except Exception as exc:  # pragma: no cover - import guard for optional depende
     QuantumCircuit = None  # type: ignore[assignment]
     StatePreparation = None  # type: ignore[assignment]
     Statevector = None  # type: ignore[assignment]
+    AerSimulator = None  # type: ignore[assignment]
     EfficientSU2 = None  # type: ignore[assignment]
     _HAS_EFFICIENT_SU2 = False
     _EFFICIENT_SU2_ERROR = exc
@@ -53,6 +58,13 @@ class VariationalQuantumBayesianRegression:
     - The current implementation follows the diagonal-prior estimator in the paper.
       Therefore, `Sigma` is required to be diagonal.
     - `fit` returns the trained statevector amplitudes prepared by the optimized ansatz.
+    - If `qiskit-aer` is installed and a GPU device is available, training uses
+      `AerSimulator(method="statevector", device="GPU")` automatically.
+    - `loss` controls the scalar objective form:
+      - `log_ratio` (default): log(a_hat + d_hat) - 2 * log(|c_hat + e_hat|).
+      - `neg_ratio`: -((c_hat + e_hat)^2 / (a_hat + d_hat)).
+    - `simulator_device_`, `simulator_backend_`, and `simulator_reason_` report
+      which statevector backend was selected (and why).
     """
 
     def __init__(
@@ -64,33 +76,39 @@ class VariationalQuantumBayesianRegression:
         maxiter: int = 100,
         epochs: Optional[int] = None,
         shuffle_batches: bool = True,
-        learning_rate: float = 0.05,
+        learning_rate: Optional[float] = None,
         spsa_perturbation: float = 0.1,
-        su2_gates: Sequence[str] = ("ry",),
+        su2_gates: Sequence[Any] | str = ("ry",),
         entanglement: str = "linear",
         eps: float = 1e-12,
+        loss: str = "log_ratio",
         random_state: Optional[int] = None,
         initial_point: Optional[np.ndarray] = None,
         use_shot_noise: bool = True,
         verbose: bool = False,
         ansatz: Optional[Any] = None,
+        prefer_gpu: bool = True,
+        require_gpu: bool = False,
     ) -> None:
         self.shots = int(shots)
         self.batch_size = int(batch_size)
         self.reps = int(reps)
-        self.optimizer = optimizer
+        self.optimizer = self._normalize_optimizer(optimizer)
         self.maxiter = int(maxiter)
         self.epochs = epochs
         self.shuffle_batches = bool(shuffle_batches)
-        self.learning_rate = float(learning_rate)
+        self.learning_rate = None if learning_rate is None else float(learning_rate)
         self.spsa_perturbation = float(spsa_perturbation)
-        self.su2_gates = tuple(su2_gates)
+        self.su2_gates = self._normalize_su2_gates(su2_gates)
         self.entanglement = entanglement
         self.eps = float(eps)
+        self.loss = self._normalize_loss(loss)
         self.initial_point = initial_point
         self.use_shot_noise = bool(use_shot_noise)
         self.verbose = bool(verbose)
         self.ansatz = ansatz
+        self.prefer_gpu = bool(prefer_gpu)
+        self.require_gpu = bool(require_gpu)
 
         self._rng = np.random.default_rng(random_state)
 
@@ -102,6 +120,13 @@ class VariationalQuantumBayesianRegression:
         self._batch_schedule: List[np.ndarray] = []
         self._batch_cursor: int = 0
         self._batch_epoch: int = 0
+        self.simulator_device_: str = "CPU"
+        self.simulator_backend_: str = "statevector_cpu"
+        self.simulator_reason_: str = "Using CPU statevector simulator."
+        self._statevector_backend: Optional[Any] = None
+
+        if self.learning_rate is not None and self.learning_rate <= 0.0:
+            raise ValueError("learning_rate must be strictly positive when provided.")
 
     def fit(
         self,
@@ -143,6 +168,8 @@ class VariationalQuantumBayesianRegression:
         self._X = X
         self._y = y
         self._V = V
+        self._configure_statevector_backend()
+        self._log_backend_selection()
 
         precision_diag = 1.0 / sigma_diag
         self._precision_diag_padded = self._pad_to_pow2(precision_diag)
@@ -169,17 +196,11 @@ class VariationalQuantumBayesianRegression:
 
         self.history_.clear()
         self._reset_batch_schedule()
-        if self._use_stochastic_optimizer():
-            self.theta_, self.result_ = self._fit_with_stochastic_optimizer(
-                theta_init,
-                iteration_callback=iteration_callback,
-            )
-        else:
-            self.result_ = self._fit_with_scipy(
-                theta_init,
-                iteration_callback=iteration_callback,
-            )
-            self.theta_ = np.asarray(self.result_.x, dtype=float)
+        self.result_ = self._fit_with_scipy(
+            theta_init,
+            iteration_callback=iteration_callback,
+        )
+        self.theta_ = np.asarray(self.result_.x, dtype=float)
         self.trained_state_ = self._statevector_from_theta(self.theta_)
         return self.trained_state_.copy()
 
@@ -265,6 +286,88 @@ class VariationalQuantumBayesianRegression:
             )
         return theta_init
 
+    @staticmethod
+    def _normalize_loss(loss: str) -> str:
+        mode = str(loss).strip().lower()
+        aliases = {
+            "log_ratio": "log_ratio",
+            "log": "log_ratio",
+            "neg_ratio": "neg_ratio",
+            "ratio": "neg_ratio",
+            "raw_ratio": "neg_ratio",
+        }
+        resolved = aliases.get(mode)
+        if resolved is None:
+            supported = ("log_ratio", "neg_ratio")
+            raise ValueError(
+                f"Unsupported loss='{loss}'. Supported values: {supported}. "
+                "Accepted aliases: 'log', 'ratio', 'raw_ratio'."
+            )
+        return resolved
+
+    @staticmethod
+    def _normalize_su2_gates(su2_gates: Sequence[Any] | str) -> tuple[Any, ...]:
+        if isinstance(su2_gates, str):
+            gates: List[Any] = [su2_gates]
+        else:
+            try:
+                gates = list(su2_gates)
+            except TypeError as exc:
+                raise TypeError(
+                    "su2_gates must be a gate name string or a sequence of gates."
+                ) from exc
+
+        if len(gates) == 0:
+            raise ValueError("su2_gates must contain at least one gate.")
+
+        normalized: List[Any] = []
+        for gate in gates:
+            if isinstance(gate, str):
+                token = gate.strip().lower()
+                if token == "":
+                    raise ValueError("su2_gates must not contain empty gate names.")
+                normalized.append(token)
+                continue
+            normalized.append(gate)
+        return tuple(normalized)
+
+    @staticmethod
+    def _coerce_pauli_su2_gate_strings(su2_gates: Sequence[Any]) -> tuple[List[Any], bool]:
+        has_pauli_string = any(
+            isinstance(gate, str) and gate in {"x", "y", "z"} for gate in su2_gates
+        )
+        if not has_pauli_string:
+            return list(su2_gates), False
+
+        try:
+            from qiskit.circuit.library.standard_gates import XGate, YGate, ZGate
+        except Exception:
+            return list(su2_gates), False
+
+        lookup = {
+            "x": XGate(),
+            "y": YGate(),
+            "z": ZGate(),
+        }
+        converted: List[Any] = []
+        changed = False
+        for gate in su2_gates:
+            if isinstance(gate, str):
+                mapped = lookup.get(gate)
+                if mapped is not None:
+                    converted.append(mapped)
+                    changed = True
+                    continue
+            converted.append(gate)
+        return converted, changed
+
+    def _compute_objective_value(self, numerator: float, denom: float) -> float:
+        if self.loss == "log_ratio":
+            # Stability transform that is monotonic-equivalent to maximizing numerator^2 / denom.
+            return float(np.log(denom) - 2.0 * np.log(np.abs(numerator) + self.eps))
+        # Direct objective: minimize the negative ratio.
+        return float(-((numerator * numerator) / denom))
+
     def _reset_batch_schedule(self) -> None:
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive.")
@@ -297,24 +400,28 @@ class VariationalQuantumBayesianRegression:
         self._batch_cursor += 1
         return batch
 
-    def _use_stochastic_optimizer(self) -> bool:
-        opt = self.optimizer.upper()
-        return opt in {"SPSA", "SGD", "ADAM"}
+    @staticmethod
+    def _normalize_optimizer(optimizer: str) -> str:
+        opt = str(optimizer).strip().upper()
+        valid = ("COBYLA", "SPSA")
+        if opt not in valid:
+            raise ValueError(
+                f"Unsupported optimizer='{optimizer}'. Supported values: {valid}."
+            )
+        return opt
 
-    def _resolve_stochastic_optimizer(self) -> str:
-        opt = self.optimizer.upper()
-        if opt in {"SPSA", "SGD", "ADAM"}:
-            return opt
-        return "SPSA"
+    def _resolve_learning_rate(self, theta_init: np.ndarray) -> float:
+        if self.learning_rate is not None:
+            return float(self.learning_rate)
 
-    def _training_steps(self) -> int:
-        steps = int(self.maxiter)
-        if self.epochs is not None:
-            epochs = int(self.epochs)
-            if epochs <= 0:
-                raise ValueError("epochs must be positive when provided.")
-            steps = min(steps, epochs * max(len(self._batch_schedule), 1))
-        return max(1, steps)
+        theta_abs = np.abs(np.asarray(theta_init, dtype=float).reshape(-1))
+        theta_scale = float(np.median(theta_abs)) if theta_abs.size > 0 else 0.0
+        if not np.isfinite(theta_scale) or theta_scale <= self.eps:
+            theta_scale = 0.01
+
+        # Auto-tune around initial parameter scale and keep it in a stable range.
+        auto_lr = float(np.clip(5.0 * theta_scale, 1e-3, 0.5))
+        return auto_lr
 
     def _fit_with_scipy(
         self,
@@ -322,137 +429,83 @@ class VariationalQuantumBayesianRegression:
         iteration_callback: Optional[Callable[[int, ObjectiveSnapshot], None]],
     ) -> OptimizeResult:
         full_batch = np.arange(self._n_samples, dtype=int)
+        scipy_method = "COBYLA"
+        spsa_lr = self._resolve_learning_rate(theta_init)
+
+        if self.optimizer == "SPSA" and self.verbose:
+            print(
+                "Optimizer 'SPSA' uses SciPy COBYLA on the mini-batch objective "
+                f"(batch_size={self.batch_size}, learning_rate={spsa_lr:.6g})."
+            )
 
         def objective(theta_vec: np.ndarray) -> float:
-            batch_snap = self._reduced_objective(theta_vec)
+            if self.optimizer == "SPSA":
+                # Mini-batch objective so `batch_size` directly affects optimization.
+                batch_snap = self._reduced_objective(theta_vec)
+                # Track full-data objective as a monitoring metric.
+                full_snap = self._objective_on_batch(
+                    theta_vec,
+                    full_batch,
+                    use_shot_noise=False,
+                    scale_batch_to_full=False,
+                )
+                self._append_snapshot(
+                    ObjectiveSnapshot(
+                        L_tilde=float(full_snap.L_tilde),
+                        a_hat=batch_snap.a_hat,
+                        c_hat=batch_snap.c_hat,
+                        d_hat=batch_snap.d_hat,
+                        e_hat=batch_snap.e_hat,
+                        h_hat=batch_snap.h_hat,
+                        batch_indices=batch_snap.batch_indices.copy(),
+                        batch_L_tilde=float(batch_snap.L_tilde),
+                        full_L_tilde=float(full_snap.L_tilde),
+                        epoch=batch_snap.epoch,
+                        batch_position=batch_snap.batch_position,
+                    ),
+                    iteration_callback=iteration_callback,
+                )
+                return float(batch_snap.L_tilde)
+
             full_snap = self._objective_on_batch(
                 theta_vec,
                 full_batch,
-                use_shot_noise=False,
+                use_shot_noise=self.use_shot_noise,
                 scale_batch_to_full=False,
             )
             self._append_snapshot(
                 ObjectiveSnapshot(
                     L_tilde=float(full_snap.L_tilde),
-                    a_hat=batch_snap.a_hat,
-                    c_hat=batch_snap.c_hat,
-                    d_hat=batch_snap.d_hat,
-                    e_hat=batch_snap.e_hat,
-                    h_hat=batch_snap.h_hat,
-                    batch_indices=batch_snap.batch_indices.copy(),
-                    batch_L_tilde=float(batch_snap.L_tilde),
+                    a_hat=full_snap.a_hat,
+                    c_hat=full_snap.c_hat,
+                    d_hat=full_snap.d_hat,
+                    e_hat=full_snap.e_hat,
+                    h_hat=full_snap.h_hat,
+                    batch_indices=full_batch.copy(),
+                    batch_L_tilde=float(full_snap.L_tilde),
                     full_L_tilde=float(full_snap.L_tilde),
-                    epoch=batch_snap.epoch,
-                    batch_position=batch_snap.batch_position,
+                    epoch=full_snap.epoch,
+                    batch_position=full_snap.batch_position,
                 ),
                 iteration_callback=iteration_callback,
             )
             return float(full_snap.L_tilde)
 
         options: Dict[str, Any] = {"maxiter": self.maxiter}
+        if self.optimizer == "SPSA":
+            # In SPSA mode we still solve with SciPy COBYLA; use learning_rate as
+            # the initial trust-region radius so it controls update aggressiveness.
+            options["rhobeg"] = float(max(spsa_lr, self.eps))
         if self.verbose:
             options["disp"] = True
 
         return minimize(
             fun=objective,
             x0=theta_init,
-            method=self.optimizer,
+            method=scipy_method,
             options=options,
-            tol=1e-6,
+            tol=1e-12,
         )
-
-    def _fit_with_stochastic_optimizer(
-        self,
-        theta_init: np.ndarray,
-        iteration_callback: Optional[Callable[[int, ObjectiveSnapshot], None]] = None,
-    ) -> tuple[np.ndarray, OptimizeResult]:
-        theta = np.asarray(theta_init, dtype=float).copy()
-        stochastic_optimizer = self._resolve_stochastic_optimizer()
-
-        if self.verbose and stochastic_optimizer != self.optimizer.upper():
-            print(
-                f"Optimizer '{self.optimizer}' is deterministic for mini-batch/noisy objectives. "
-                f"Using stochastic optimizer '{stochastic_optimizer}' instead."
-            )
-
-        full_batch = np.arange(self._n_samples, dtype=int)
-        steps = self._training_steps()
-
-        beta1 = 0.9
-        beta2 = 0.999
-        adam_m = np.zeros_like(theta, dtype=float)
-        adam_v = np.zeros_like(theta, dtype=float)
-
-        nfev = 0
-        stable_steps = 0
-        prev_full_loss: Optional[float] = None
-        tol = max(self.eps, 1e-9)
-
-        for step in range(1, steps + 1):
-            batch = self._next_batch_indices().copy()
-            grad, evals = self._spsa_gradient(theta, batch, step)
-            nfev += evals
-
-            theta, adam_m, adam_v = self._apply_stochastic_step(
-                theta=theta,
-                grad=grad,
-                step=step,
-                stochastic_optimizer=stochastic_optimizer,
-                adam_m=adam_m,
-                adam_v=adam_v,
-                beta1=beta1,
-                beta2=beta2,
-            )
-
-            batch_snap = self._objective_on_batch(
-                theta,
-                batch,
-                use_shot_noise=self.use_shot_noise,
-                scale_batch_to_full=True,
-            )
-            full_snap = self._objective_on_batch(
-                theta,
-                full_batch,
-                use_shot_noise=False,
-                scale_batch_to_full=False,
-            )
-            nfev += 2
-
-            monitored_loss = float(full_snap.L_tilde)
-            self._append_snapshot(
-                ObjectiveSnapshot(
-                    L_tilde=monitored_loss,
-                    a_hat=batch_snap.a_hat,
-                    c_hat=batch_snap.c_hat,
-                    d_hat=batch_snap.d_hat,
-                    e_hat=batch_snap.e_hat,
-                    h_hat=batch_snap.h_hat,
-                    batch_indices=batch.copy(),
-                    batch_L_tilde=float(batch_snap.L_tilde),
-                    full_L_tilde=float(full_snap.L_tilde),
-                    epoch=self._batch_epoch,
-                    batch_position=self._batch_cursor,
-                ),
-                iteration_callback=iteration_callback,
-            )
-
-            if prev_full_loss is not None and abs(monitored_loss - prev_full_loss) <= tol:
-                stable_steps += 1
-                if stable_steps >= 5:
-                    break
-            else:
-                stable_steps = 0
-            prev_full_loss = monitored_loss
-
-        result = OptimizeResult(
-            x=theta.copy(),
-            fun=float(self.history_[-1].L_tilde) if self.history_ else np.nan,
-            nit=len(self.history_),
-            nfev=nfev,
-            success=True,
-            message=f"Stochastic optimizer ({stochastic_optimizer}) finished.",
-        )
-        return theta, result
 
     def _append_snapshot(
         self,
@@ -462,66 +515,6 @@ class VariationalQuantumBayesianRegression:
         self.history_.append(snapshot)
         if iteration_callback is not None:
             iteration_callback(len(self.history_), snapshot)
-
-    def _spsa_gradient(
-        self,
-        theta: np.ndarray,
-        batch_indices: np.ndarray,
-        step: int,
-    ) -> tuple[np.ndarray, int]:
-        c_t = self.spsa_perturbation / (float(step) ** 0.101)
-        c_t = float(max(c_t, self.eps))
-        delta = self._rng.choice(np.array([-1.0, 1.0]), size=theta.shape[0])
-
-        l_plus = self._objective_on_batch(
-            theta + c_t * delta,
-            batch_indices,
-            # Use expectation values for gradient estimation to reduce variance.
-            use_shot_noise=False,
-            scale_batch_to_full=True,
-        ).L_tilde
-        l_minus = self._objective_on_batch(
-            theta - c_t * delta,
-            batch_indices,
-            use_shot_noise=False,
-            scale_batch_to_full=True,
-        ).L_tilde
-
-        grad = ((l_plus - l_minus) / (2.0 * c_t)) * delta
-        return np.asarray(grad, dtype=float), 2
-
-    def _apply_stochastic_step(
-        self,
-        theta: np.ndarray,
-        grad: np.ndarray,
-        step: int,
-        stochastic_optimizer: str,
-        adam_m: np.ndarray,
-        adam_v: np.ndarray,
-        beta1: float,
-        beta2: float,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        grad_norm = float(np.linalg.norm(grad))
-        if grad_norm > 1000.0:
-            grad = grad * (1000.0 / grad_norm)
-
-        if stochastic_optimizer == "ADAM":
-            adam_m = beta1 * adam_m + (1.0 - beta1) * grad
-            adam_v = beta2 * adam_v + (1.0 - beta2) * (grad * grad)
-            m_hat = adam_m / (1.0 - beta1**step)
-            v_hat = adam_v / (1.0 - beta2**step)
-            theta = theta - self.learning_rate * m_hat / (np.sqrt(v_hat) + 1e-8)
-            return theta, adam_m, adam_v
-
-        if stochastic_optimizer == "SGD":
-            step_size = self.learning_rate / np.sqrt(float(step))
-            theta = theta - step_size * grad
-            return theta, adam_m, adam_v
-
-        # SPSA default schedule to avoid overly aggressive first updates.
-        step_size = self.learning_rate / ((float(step) + 10.0) ** 0.602)
-        theta = theta - step_size * grad
-        return theta, adam_m, adam_v
 
     @staticmethod
     def _pad_to_pow2(vec: np.ndarray) -> np.ndarray:
@@ -550,19 +543,43 @@ class VariationalQuantumBayesianRegression:
                 )
             return ansatz
 
+        su2_gates = list(self.su2_gates)
+        fallback_gates, has_fallback = self._coerce_pauli_su2_gate_strings(su2_gates)
+
         if _HAS_EFFICIENT_SU2:
-            return efficient_su2(
+            try:
+                return efficient_su2(
+                    num_qubits,
+                    su2_gates=su2_gates,
+                    entanglement=self.entanglement,
+                    reps=self.reps,
+                )
+            except Exception:
+                if has_fallback:
+                    return efficient_su2(
+                        num_qubits,
+                        su2_gates=fallback_gates,
+                        entanglement=self.entanglement,
+                        reps=self.reps,
+                    )
+                raise
+
+        try:
+            return EfficientSU2(
                 num_qubits,
-                su2_gates=list(self.su2_gates),
+                su2_gates=su2_gates,
                 entanglement=self.entanglement,
                 reps=self.reps,
             )
-        return EfficientSU2(
-            num_qubits,
-            su2_gates=list(self.su2_gates),
-            entanglement=self.entanglement,
-            reps=self.reps,
-        )
+        except Exception:
+            if has_fallback:
+                return EfficientSU2(
+                    num_qubits,
+                    su2_gates=fallback_gates,
+                    entanglement=self.entanglement,
+                    reps=self.reps,
+                )
+            raise
 
     def _build_state_prep_gate(self, vec: np.ndarray, label: str) -> Any:
         vec = np.asarray(vec, dtype=complex).reshape(-1)
@@ -576,6 +593,133 @@ class VariationalQuantumBayesianRegression:
         if hasattr(prep, "to_gate"):
             return prep.to_gate(label=label)
         return prep
+
+    def _configure_statevector_backend(self) -> None:
+        self._statevector_backend = None
+        self.simulator_device_ = "CPU"
+        self.simulator_backend_ = "statevector_cpu"
+        self.simulator_reason_ = "Using CPU statevector simulator."
+
+        def _cpu_fallback(reason: str) -> None:
+            self._statevector_backend = None
+            self.simulator_device_ = "CPU"
+            self.simulator_backend_ = "statevector_cpu"
+            self.simulator_reason_ = reason
+            if self.verbose:
+                print(reason)
+
+        if not self.prefer_gpu:
+            reason = "Using CPU statevector simulator (prefer_gpu=False)."
+            _cpu_fallback(reason)
+            if self.require_gpu:
+                raise RuntimeError(
+                    "GPU execution was required but disabled with prefer_gpu=False."
+                )
+            return
+        if AerSimulator is None:
+            reason = (
+                "Using CPU statevector simulator "
+                "(qiskit-aer not installed; install qiskit-aer-gpu for GPU support)."
+            )
+            _cpu_fallback(reason)
+            if self.require_gpu:
+                raise RuntimeError(
+                    "GPU execution was required but qiskit-aer is unavailable. "
+                    "Install `qiskit-aer-gpu` in the active environment."
+                )
+            return
+
+        available_devices: set[str] = set()
+        if hasattr(AerSimulator, "available_devices"):
+            try:
+                available_devices = {
+                    str(device).strip().upper() for device in AerSimulator.available_devices()
+                }
+            except Exception:
+                available_devices = set()
+        if not available_devices:
+            try:
+                available_devices = {
+                    str(device).strip().upper()
+                    for device in AerSimulator().available_devices()
+                }
+            except Exception:
+                available_devices = set()
+
+        if available_devices and "GPU" not in available_devices:
+            reason = (
+                "Using CPU statevector simulator "
+                "(GPU device unavailable in Aer available_devices())."
+            )
+            _cpu_fallback(reason)
+            if self.require_gpu:
+                raise RuntimeError(
+                    "GPU execution was required but Aer reports no GPU device. "
+                    f"Available devices: {sorted(available_devices)}"
+                )
+            return
+
+        try:
+            self._statevector_backend = AerSimulator(method="statevector", device="GPU")
+            self.simulator_device_ = "GPU"
+            self.simulator_backend_ = "AerSimulator(statevector,GPU)"
+            self.simulator_reason_ = "Using AerSimulator(method='statevector', device='GPU')."
+            if self.verbose:
+                print("Using AerSimulator(method='statevector', device='GPU').")
+        except Exception as exc:
+            reason = "Using CPU statevector simulator (failed to initialize Aer GPU backend)."
+            _cpu_fallback(reason)
+            if self.require_gpu:
+                raise RuntimeError(
+                    "GPU execution was required but Aer GPU backend initialization failed."
+                ) from exc
+
+    def _log_backend_selection(self) -> None:
+        print(
+            "[VQBR] backend="
+            f"{self.simulator_backend_}, "
+            f"device={self.simulator_device_}, "
+            f"reason={self.simulator_reason_}",
+            flush=True,
+        )
+
+    def _simulate_statevector(self, qc: QuantumCircuit) -> np.ndarray:
+        if self._statevector_backend is None:
+            sv = Statevector.from_instruction(qc)
+            return np.asarray(sv.data, dtype=complex)
+
+        try:
+            sim_qc = qc.copy()
+            if hasattr(sim_qc, "save_statevector"):
+                sim_qc.save_statevector()
+            result = self._statevector_backend.run(sim_qc).result()
+            state = None
+            try:
+                data = result.data(0)
+                state = data.get("statevector")
+                if state is None:
+                    state = data.get("final_statevector")
+            except Exception:
+                state = None
+            if state is None:
+                state = result.get_statevector(sim_qc)
+            return np.asarray(state, dtype=complex)
+        except Exception as exc:
+            # Fall back if backend execution fails (e.g., GPU transient/unavailable at runtime).
+            if self.require_gpu:
+                raise RuntimeError(
+                    "GPU execution was required but Aer GPU statevector simulation failed."
+                ) from exc
+            self._statevector_backend = None
+            self.simulator_device_ = "CPU"
+            self.simulator_backend_ = "statevector_cpu"
+            self.simulator_reason_ = (
+                "Falling back to CPU statevector simulator (Aer GPU execution failed)."
+            )
+            if self.verbose:
+                print(self.simulator_reason_)
+            sv = Statevector.from_instruction(qc)
+            return np.asarray(sv.data, dtype=complex)
 
     def _theta_bind(self, theta_vec: np.ndarray) -> Dict[Any, float]:
         theta_vec = np.asarray(theta_vec, dtype=float).reshape(-1)
@@ -609,8 +753,8 @@ class VariationalQuantumBayesianRegression:
         use_shot_noise: Optional[bool] = None,
     ) -> float:
         qc = self._build_overlap_circuit(Uv_gate, theta_vec)
-        sv = Statevector.from_instruction(qc)
-        p0 = float(sv.probabilities(qargs=[0])[0])
+        state = self._simulate_statevector(qc)
+        p0 = float(np.sum(np.abs(state[0::2]) ** 2))
         p0 = float(np.clip(p0, 0.0, 1.0))
 
         apply_shot_noise = self.use_shot_noise if use_shot_noise is None else bool(use_shot_noise)
@@ -628,8 +772,8 @@ class VariationalQuantumBayesianRegression:
         bound_ansatz = self._ansatz.assign_parameters(self._theta_bind(theta_vec), inplace=False)
         qc.compose(bound_ansatz, inplace=True)
 
-        sv = Statevector.from_instruction(qc)
-        probs = np.asarray(sv.probabilities(), dtype=float)
+        state = self._simulate_statevector(qc)
+        probs = np.abs(state) ** 2
         probs = probs / np.sum(probs)
 
         apply_shot_noise = self.use_shot_noise if use_shot_noise is None else bool(use_shot_noise)
@@ -680,9 +824,7 @@ class VariationalQuantumBayesianRegression:
 
         denom = a_hat + d_hat + self.eps
         numerator = c_hat + e_hat
-        # Stability transform: minimize log(denom) - 2*log(|numerator|),
-        # which is monotonic-equivalent to maximizing (numerator^2 / denom).
-        L_tilde = np.log(denom) - 2.0 * np.log(np.abs(numerator) + self.eps)
+        L_tilde = self._compute_objective_value(numerator=numerator, denom=denom)
 
         return ObjectiveSnapshot(
             L_tilde=float(L_tilde),
@@ -711,8 +853,7 @@ class VariationalQuantumBayesianRegression:
         qc = QuantumCircuit(self._num_qubits)
         bound_ansatz = self._ansatz.assign_parameters(self._theta_bind(theta_vec), inplace=False)
         qc.compose(bound_ansatz, inplace=True)
-        sv = Statevector.from_instruction(qc)
-        state = np.asarray(sv.data, dtype=complex)
+        state = self._simulate_statevector(qc)
         norm = np.linalg.norm(state)
         if norm <= 0.0:
             raise RuntimeError("Invalid trained state with zero norm.")

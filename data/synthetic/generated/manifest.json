@@ -1,0 +1,147 @@
+{
+  "dimensions": [
+    8,
+    16,
+    32,
+    64,
+    128
+  ],
+  "sample_multipliers": [
+    2,
+    5,
+    10
+  ],
+  "pairs": [
+    {
+      "pair_name": "N16_D8",
+      "N": 16,
+      "D": 8,
+      "d": 3,
+      "padded_dim": 8
+    },
+    {
+      "pair_name": "N40_D8",
+      "N": 40,
+      "D": 8,
+      "d": 3,
+      "padded_dim": 8
+    },
+    {
+      "pair_name": "N80_D8",
+      "N": 80,
+      "D": 8,
+      "d": 3,
+      "padded_dim": 8
+    },
+    {
+      "pair_name": "N32_D16",
+      "N": 32,
+      "D": 16,
+      "d": 4,
+      "padded_dim": 16
+    },
+    {
+      "pair_name": "N80_D16",
+      "N": 80,
+      "D": 16,
+      "d": 4,
+      "padded_dim": 16
+    },
+    {
+      "pair_name": "N160_D16",
+      "N": 160,
+      "D": 16,
+      "d": 4,
+      "padded_dim": 16
+    },
+    {
+      "pair_name": "N64_D32",
+      "N": 64,
+      "D": 32,
+      "d": 5,
+      "padded_dim": 32
+    },
+    {
+      "pair_name": "N160_D32",
+      "N": 160,
+      "D": 32,
+      "d": 5,
+      "padded_dim": 32
+    },
+    {
+      "pair_name": "N320_D32",
+      "N": 320,
+      "D": 32,
+      "d": 5,
+      "padded_dim": 32
+    },
+    {
+      "pair_name": "N128_D64",
+      "N": 128,
+      "D": 64,
+      "d": 6,
+      "padded_dim": 64
+    },
+    {
+      "pair_name": "N320_D64",
+      "N": 320,
+      "D": 64,
+      "d": 6,
+      "padded_dim": 64
+    },
+    {
+      "pair_name": "N640_D64",
+      "N": 640,
+      "D": 64,
+      "d": 6,
+      "padded_dim": 64
+    },
+    {
+      "pair_name": "N256_D128",
+      "N": 256,
+      "D": 128,
+      "d": 7,
+      "padded_dim": 128
+    },
+    {
+      "pair_name": "N640_D128",
+      "N": 640,
+      "D": 128,
+      "d": 7,
+      "padded_dim": 128
+    },
+    {
+      "pair_name": "N1280_D128",
+      "N": 1280,
+      "D": 128,
+      "d": 7,
+      "padded_dim": 128
+    }
+  ],
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "noise_std": 0.1,
+  "train_ratio": 0.8,
+  "test_ratio": 0.19999999999999996,
+  "notes": "For each pair (N, D), train/test files are generated for the same seed set. X entries are i.i.d standard normal and y = X @ w_true + epsilon with epsilon ~ N(0, sigma^2 I)."
+}

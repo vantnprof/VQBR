@@ -26,7 +26,7 @@ EPS = 1e-12
 METHOD_KEYS = ("vqbr_cobyla", "vqbr_spsa")
 METRIC_KEYS = (
     "cosine_similarity",
-    "euclidean_distance",
+    "relative_l2_distance",
     "train_mse",
     "test_mse",
 )
@@ -116,21 +116,37 @@ def _make_vqbr_iteration_logger(
 ) -> Any:
     if log_every_iter <= 0:
         raise ValueError("--log-every-iter must be a positive integer.")
+    prev_batch_loss: float | None = None
+
+    def _format_delta(current: float, previous: float | None) -> str:
+        if previous is None:
+            return "delta=--"
+        if not np.isfinite(current) or not np.isfinite(previous):
+            return "delta=n/a"
+        diff = float(current - previous)
+        if diff > 0.0:
+            return f"delta=↑ {abs(diff):.6e}"
+        if diff < 0.0:
+            return f"delta=↓ {abs(diff):.6e}"
+        return "delta=→ 0.000000e+00"
 
     def _callback(iteration: int, snapshot: Any) -> None:
-        if iteration != 1 and (iteration % log_every_iter != 0):
-            return
+        nonlocal prev_batch_loss
         batch_loss = float(getattr(snapshot, "batch_L_tilde", np.nan))
         if not np.isfinite(batch_loss):
             batch_loss = float(getattr(snapshot, "L_tilde", np.nan))
-        print(
-            "    "
-            f"[{prior_case}][seed={seed}][{method_key}] "
-            f"{optimizer} iter {iteration:>4d} | "
-            f"mode={batch_mode}, batch_size={batch_size} | "
-            f"batch_loss={batch_loss: .6e}",
-            flush=True,
-        )
+        delta_text = _format_delta(batch_loss, prev_batch_loss)
+        should_log = (iteration == 1) or (iteration % log_every_iter == 0)
+        if should_log:
+            print(
+                "    "
+                f"[{prior_case}][seed={seed}][{method_key}] "
+                f"{optimizer} iter {iteration:>4d} | "
+                f"mode={batch_mode}, batch_size={batch_size} | "
+                f"batch_loss={batch_loss: .6e}, {delta_text}",
+                flush=True,
+            )
+        prev_batch_loss = batch_loss
 
     return _callback
 
@@ -154,6 +170,52 @@ def _resolve_seeds(num_seeds: int, seed_offset: int, explicit_seeds: str | None)
     if num_seeds <= 0:
         raise ValueError("--num-seeds must be positive.")
     return [seed_offset + i for i in range(num_seeds)]
+
+
+def _parse_vqbr_optimizer_names(raw: str) -> List[str]:
+    tokens = [x.strip().upper() for x in raw.split(",") if x.strip()]
+    if not tokens:
+        raise ValueError("--vqbr-optimizer must include at least one optimizer name.")
+
+    valid = {str(setting["optimizer"]).upper() for setting in VQBR_OPTIMIZER_SETTINGS}
+    invalid = sorted({token for token in tokens if token not in valid})
+    if invalid:
+        raise ValueError(
+            "Unsupported --vqbr-optimizer values: "
+            f"{', '.join(invalid)}. Supported values: {', '.join(sorted(valid))}."
+        )
+
+    unique_tokens: List[str] = []
+    for token in tokens:
+        if token not in unique_tokens:
+            unique_tokens.append(token)
+    return unique_tokens
+
+
+def _select_vqbr_optimizer_settings(raw: str) -> List[Dict[str, Any]]:
+    selected_optimizer_names = _parse_vqbr_optimizer_names(raw)
+    settings_by_optimizer = {
+        str(setting["optimizer"]).upper(): setting for setting in VQBR_OPTIMIZER_SETTINGS
+    }
+    return [settings_by_optimizer[name] for name in selected_optimizer_names]
+
+
+def _normalize_vqbr_loss(raw: str) -> str:
+    mode = str(raw).strip().lower()
+    aliases = {
+        "log_ratio": "log_ratio",
+        "log": "log_ratio",
+        "neg_ratio": "neg_ratio",
+        "ratio": "neg_ratio",
+        "raw_ratio": "neg_ratio",
+    }
+    resolved = aliases.get(mode)
+    if resolved is None:
+        raise ValueError(
+            "Unsupported --vqbr-loss value. Supported values: "
+            "log_ratio, neg_ratio (aliases: log, ratio, raw_ratio)."
+        )
+    return resolved
 
 
 def _load_naval_dataset(dataset_path: Path, target_col: str) -> tuple[np.ndarray, np.ndarray, List[str]]:
@@ -391,15 +453,16 @@ def _evaluate_vqbr_metrics(
     y_test_pred = np.asarray(X_test, dtype=float) @ np.asarray(
         reconstructed_vector, dtype=float
     ) + float(y_train_mean)
+    w_star_arr = np.asarray(w_star, dtype=float)
+    reconstruction_arr = np.asarray(reconstructed_vector, dtype=float)
+    w_star_norm = float(np.linalg.norm(w_star_arr))
+    relative_l2_distance = float(
+        np.linalg.norm(reconstruction_arr - w_star_arr) / max(w_star_norm, EPS)
+    )
 
     return {
         "cosine_similarity": _safe_cosine(reconstructed_vector, w_star),
-        "euclidean_distance": float(
-            np.linalg.norm(
-                np.asarray(reconstructed_vector, dtype=float)
-                - np.asarray(w_star, dtype=float)
-            )
-        ),
+        "relative_l2_distance": relative_l2_distance,
         "train_mse": _mse(y_train_raw, y_train_pred),
         "test_mse": _mse(y_test_raw, y_test_pred),
         "batch_L_hat": float(final_batch_L_hat),
@@ -407,7 +470,7 @@ def _evaluate_vqbr_metrics(
         "batch_loss_history": [float(x) for x in batch_loss_history],
         # Kept for backward compatibility with older plotting helpers.
         "loss_history": [float(x) for x in batch_loss_history],
-        "closed_form_norm": float(np.linalg.norm(w_star)),
+        "closed_form_norm": w_star_norm,
         "encoding_vector": [float(x) for x in np.asarray(encoding_vector, dtype=float)],
         "reconstructed_vector": [
             float(x) for x in np.asarray(reconstructed_vector, dtype=float)
@@ -515,8 +578,10 @@ def _resolve_vqbr_optimizer_configs(
     if args.vqbr_batch_size <= 0:
         raise ValueError("--vqbr-batch-size must be positive.")
 
+    selected_settings = _select_vqbr_optimizer_settings(args.vqbr_optimizer)
+
     configs: List[Dict[str, Any]] = []
-    for setting in VQBR_OPTIMIZER_SETTINGS:
+    for setting in selected_settings:
         use_full_batch = bool(setting["use_full_batch"])
         if use_full_batch:
             batch_size_used = int(n_train_samples)
@@ -600,6 +665,20 @@ def _run_one_seed_one_prior(
     w_star = closed_form.get_weights()
 
     methods: Dict[str, Dict[str, Any]] = {}
+    y_train_pred_closed_form = np.asarray(closed_form.predict(X_train), dtype=float) + float(y_train_mean)
+    y_test_pred_closed_form = np.asarray(closed_form.predict(X_test), dtype=float) + float(y_train_mean)
+    methods["closed_form"] = {
+        "train_mse": _mse(y_train_raw, y_train_pred_closed_form),
+        "test_mse": _mse(y_test_raw, y_test_pred_closed_form),
+    }
+    if args.log_realtime:
+        print(
+            "    "
+            f"[{prior_case}][seed={seed}][closed_form] "
+            f"train_mse={methods['closed_form']['train_mse']:.6f}, "
+            f"test_mse={methods['closed_form']['test_mse']:.6f}",
+            flush=True,
+        )
 
     vqbr_module = importlib.import_module("vqbr")
     VariationalQuantumBayesianRegression = getattr(
@@ -609,6 +688,7 @@ def _run_one_seed_one_prior(
         args=args,
         n_train_samples=int(X_train.shape[0]),
     )
+    vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
     for opt_cfg in optimizer_configs:
         method_key = str(opt_cfg["method_key"])
         optimizer_name = str(opt_cfg["optimizer"])
@@ -621,6 +701,7 @@ def _run_one_seed_one_prior(
                 "    "
                 f"[{prior_case}][seed={seed}][{method_key}] "
                 f"training start: optimizer={optimizer_name}, "
+                f"loss={vqbr_loss}, "
                 f"mode={batch_mode}, batch_size={batch_size_used}, "
                 f"shuffle_batches={shuffle_batches}",
                 flush=True,
@@ -634,6 +715,7 @@ def _run_one_seed_one_prior(
             maxiter=args.vqbr_maxiter,
             shuffle_batches=shuffle_batches,
             learning_rate=args.vqbr_learning_rate,
+            loss=vqbr_loss,
             random_state=seed,
             use_shot_noise=args.vqbr_use_shot_noise,
             verbose=args.vqbr_verbose,
@@ -689,6 +771,7 @@ def _run_one_seed_one_prior(
         vqbr_metrics["batch_mode"] = batch_mode
         vqbr_metrics["batch_size_used"] = int(batch_size_used)
         vqbr_metrics["shuffle_batches"] = bool(shuffle_batches)
+        vqbr_metrics["loss"] = str(vqbr_loss)
         vqbr_metrics["trained_circuit"] = _serialize_trained_circuit(trained_circuit)
         vqbr_metrics["statevector_source"] = "simulated_from_trained_circuit"
         vqbr_metrics["fit_vs_sim_state_l2"] = fit_vs_sim_l2
@@ -699,7 +782,7 @@ def _run_one_seed_one_prior(
                 "    "
                 f"[{prior_case}][seed={seed}][{method_key}] "
                 f"cos={vqbr_metrics['cosine_similarity']:.6f}, "
-                f"euclid={vqbr_metrics['euclidean_distance']:.6e}, "
+                f"rel_l2={vqbr_metrics['relative_l2_distance']:.6e}, "
                 f"train_mse={vqbr_metrics['train_mse']:.6f}, "
                 f"test_mse={vqbr_metrics['test_mse']:.6f}, "
                 f"batch_L_hat={vqbr_metrics['batch_L_hat']:.6e}",
@@ -745,6 +828,10 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("--log-every-iter must be a positive integer.")
     if args.vqbr_batch_size <= 0:
         raise ValueError("--vqbr-batch-size must be a positive integer.")
+    vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
+    selected_optimizer_settings = _select_vqbr_optimizer_settings(args.vqbr_optimizer)
+    selected_method_keys = [str(setting["method_key"]) for setting in selected_optimizer_settings]
+    reported_method_keys = ["closed_form"] + selected_method_keys
 
     seeds = _resolve_seeds(
         num_seeds=args.num_seeds,
@@ -774,7 +861,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             "V_grid": [float(x) for x in V_grid],
             "lambda_grid": [float(x) for x in lambda_grid],
             "prior_delta": float(args.prior_delta),
-            "methods": list(METHOD_KEYS),
+            "methods": reported_method_keys,
             "vqbr": {
                 "shots": int(args.vqbr_shots),
                 "batch_size": int(args.vqbr_batch_size),
@@ -782,22 +869,25 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
                 "maxiter": int(args.vqbr_maxiter),
                 "shuffle_batches": bool(args.vqbr_shuffle_batches),
                 "learning_rate": float(args.vqbr_learning_rate),
+                "loss": str(vqbr_loss),
                 "use_shot_noise": bool(args.vqbr_use_shot_noise),
                 "optimizers": [
                     {
-                        "method_key": "vqbr_cobyla",
-                        "optimizer": "COBYLA",
-                        "batch_mode": "full_data",
-                        "batch_size": "n_train_total",
-                        "shuffle_batches": False,
-                    },
-                    {
-                        "method_key": "vqbr_spsa",
-                        "optimizer": "SPSA",
-                        "batch_mode": "mini_batch",
-                        "batch_size": int(args.vqbr_batch_size),
-                        "shuffle_batches": bool(args.vqbr_shuffle_batches),
-                    },
+                        "method_key": str(setting["method_key"]),
+                        "optimizer": str(setting["optimizer"]).upper(),
+                        "batch_mode": str(setting["batch_mode"]),
+                        "batch_size": (
+                            "n_train_total"
+                            if bool(setting["use_full_batch"])
+                            else int(args.vqbr_batch_size)
+                        ),
+                        "shuffle_batches": (
+                            False
+                            if bool(setting["use_full_batch"])
+                            else bool(args.vqbr_shuffle_batches)
+                        ),
+                    }
+                    for setting in selected_optimizer_settings
                 ],
             },
             "logging": {
@@ -830,21 +920,26 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         f"maxiter={int(args.vqbr_maxiter)}"
     )
     print("  optimizer runs:")
-    print(
-        "    "
-        "vqbr_cobyla: optimizer=COBYLA, mode=full_data, "
-        "batch_size=n_train_total, shuffle_batches=False"
-    )
-    print(
-        "    "
-        f"vqbr_spsa: optimizer=SPSA, mode=mini_batch, "
-        f"batch_size=min({int(args.vqbr_batch_size)}, n_train_total), "
-        f"shuffle_batches={bool(args.vqbr_shuffle_batches)}"
-    )
+    for setting in selected_optimizer_settings:
+        method_key = str(setting["method_key"])
+        optimizer = str(setting["optimizer"]).upper()
+        batch_mode = str(setting["batch_mode"])
+        if bool(setting["use_full_batch"]):
+            batch_size_desc = "n_train_total"
+            shuffle_batches = False
+        else:
+            batch_size_desc = f"min({int(args.vqbr_batch_size)}, n_train_total)"
+            shuffle_batches = bool(args.vqbr_shuffle_batches)
+        print(
+            "    "
+            f"{method_key}: optimizer={optimizer}, mode={batch_mode}, "
+            f"batch_size={batch_size_desc}, shuffle_batches={shuffle_batches}"
+        )
     print(
         "  "
         f"shuffle_batches={bool(args.vqbr_shuffle_batches)}, "
-        f"learning_rate={float(args.vqbr_learning_rate):.6g}"
+        f"learning_rate={float(args.vqbr_learning_rate):.6g}, "
+        f"loss={vqbr_loss}"
     )
     print(
         "  "
@@ -940,11 +1035,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vqbr-reps", type=int, default=2)
     parser.add_argument(
         "--vqbr-optimizer",
+        "--vqbr-optimizers",
+        dest="vqbr_optimizer",
         type=str,
         default="COBYLA,SPSA",
         help=(
-            "Deprecated. This script always runs both optimizers: "
-            "COBYLA (full-data iterations) and SPSA (mini-batch iterations)."
+            "Comma-separated VQBR optimizers to run. "
+            "Supported values: COBYLA,SPSA (case-insensitive)."
         ),
     )
     parser.add_argument("--vqbr-maxiter", type=int, default=200)
@@ -952,6 +1049,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-vqbr-shuffle-batches", dest="vqbr_shuffle_batches", action="store_false")
     parser.set_defaults(vqbr_shuffle_batches=True)
     parser.add_argument("--vqbr-learning-rate", type=float, default=0.05)
+    parser.add_argument(
+        "--vqbr-loss",
+        type=str,
+        default="log_ratio",
+        help=(
+            "VQBR objective form. "
+            "Supported values: log_ratio, neg_ratio "
+            "(aliases: log, ratio, raw_ratio)."
+        ),
+    )
     parser.add_argument("--vqbr-use-shot-noise", action="store_true")
     parser.add_argument("--no-vqbr-shot-noise", dest="vqbr_use_shot_noise", action="store_false")
     parser.set_defaults(vqbr_use_shot_noise=True)

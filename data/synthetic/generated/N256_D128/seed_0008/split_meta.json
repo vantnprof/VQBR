@@ -1,0 +1,16 @@
+{
+  "pair_name": "N256_D128",
+  "seed": 8,
+  "N": 256,
+  "D": 128,
+  "d": 7,
+  "padded_dim": 128,
+  "train_ratio": 0.8,
+  "test_ratio": 0.19999999999999996,
+  "n_train": 204,
+  "n_test": 52,
+  "noise_std": 0.1,
+  "train_file": "train.npz",
+  "test_file": "test.npz",
+  "params_file": "params.npz"
+}

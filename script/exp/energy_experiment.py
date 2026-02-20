@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import itertools
 import json
+import os
+import re
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, TextIO, Tuple
 
 import numpy as np
 import pandas as pd
@@ -27,7 +31,7 @@ EPS = 1e-12
 METHOD_KEYS = ("vqbr_cobyla", "vqbr_spsa")
 METRIC_KEYS = (
     "cosine_similarity",
-    "euclidean_distance",
+    "relative_l2_distance",
     "train_mse",
     "test_mse",
 )
@@ -54,6 +58,61 @@ class SplitData:
     test_indices: np.ndarray
     train_val_indices: np.ndarray
     val_indices: np.ndarray
+
+
+@dataclass(frozen=True)
+class VQBRGridConfig:
+    config_id: str
+    shots: int
+    maxiter: int
+    reps: int
+    su2_gates: Tuple[str, ...]
+    entanglement: str
+    loss: str
+
+
+@dataclass
+class PreparedSeedRun:
+    seed: int
+    split: Dict[str, Any]
+    preprocessing: Dict[str, Any]
+    selected_hyperparameters: Dict[str, float]
+    X_train: np.ndarray
+    y_train_raw: np.ndarray
+    X_test: np.ndarray
+    y_test_raw: np.ndarray
+    y_train_centered: np.ndarray
+    y_train_mean: float
+    m0_train: np.ndarray
+    sigma_diag_train: np.ndarray
+    V_selected: float
+    w_star: np.ndarray
+    closed_form_metrics: Dict[str, float]
+
+
+class _TeeStream:
+    def __init__(self, streams: List[TextIO]) -> None:
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+    def isatty(self) -> bool:
+        return any(getattr(stream, "isatty", lambda: False)() for stream in self._streams)
+
+    @property
+    def encoding(self) -> str:
+        for stream in self._streams:
+            enc = getattr(stream, "encoding", None)
+            if isinstance(enc, str):
+                return enc
+        return "utf-8"
 
 
 def _fit_feature_standardizer(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -95,23 +154,84 @@ def _make_vqbr_iteration_logger(
 ) -> Any:
     if log_every_iter <= 0:
         raise ValueError("--log-every-iter must be a positive integer.")
+    process_pid = int(os.getpid())
+    prev_batch_loss: float | None = None
+
+    def _format_delta(current: float, previous: float | None) -> str:
+        if previous is None:
+            return "delta=--"
+        if not np.isfinite(current) or not np.isfinite(previous):
+            return "delta=n/a"
+        diff = float(current - previous)
+        if diff > 0.0:
+            return f"delta=↑ {abs(diff):.6e}"
+        if diff < 0.0:
+            return f"delta=↓ {abs(diff):.6e}"
+        return "delta=→ 0.000000e+00"
 
     def _callback(iteration: int, snapshot: Any) -> None:
-        if iteration != 1 and (iteration % log_every_iter != 0):
-            return
+        nonlocal prev_batch_loss
         batch_loss = float(getattr(snapshot, "batch_L_tilde", np.nan))
         if not np.isfinite(batch_loss):
             batch_loss = float(getattr(snapshot, "L_tilde", np.nan))
-        print(
-            "    "
-            f"[{prior_case}][seed={seed}][{method_key}] "
-            f"{optimizer} iter {iteration:>4d} | "
-            f"mode={batch_mode}, batch_size={batch_size} | "
-            f"batch_loss={batch_loss: .6e}",
-            flush=True,
-        )
+        delta_text = _format_delta(batch_loss, prev_batch_loss)
+        should_log = (iteration == 1) or (iteration % log_every_iter == 0)
+        if should_log:
+            cuda_memory = _query_cuda_memory_usage_mb(process_pid)
+            print(
+                "    "
+                f"[{prior_case}][seed={seed}][{method_key}] "
+                f"{optimizer} iter {iteration:>4d} | "
+                f"mode={batch_mode}, batch_size={batch_size} | "
+                f"batch_loss={batch_loss: .6e}, {delta_text}, cuda_mem={cuda_memory}",
+                flush=True,
+            )
+        prev_batch_loss = batch_loss
 
     return _callback
+
+
+def _query_cuda_memory_usage_mb(pid: int) -> str:
+    cmd = [
+        "nvidia-smi",
+        "--query-compute-apps=pid,used_memory",
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except Exception:
+        return "n/a"
+
+    if result.returncode != 0:
+        return "n/a"
+
+    total_used_mb = 0.0
+    found = False
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            line_pid = int(parts[0])
+            used_mb = float(parts[1])
+        except ValueError:
+            continue
+        if line_pid != pid:
+            continue
+        total_used_mb += used_mb
+        found = True
+
+    if not found:
+        return "0 MiB"
+    if float(total_used_mb).is_integer():
+        return f"{int(total_used_mb)} MiB"
+    return f"{total_used_mb:.1f} MiB"
 
 
 def _parse_float_grid(raw: str) -> np.ndarray:
@@ -133,6 +253,172 @@ def _resolve_seeds(num_seeds: int, seed_offset: int, explicit_seeds: str | None)
     if num_seeds <= 0:
         raise ValueError("--num-seeds must be positive.")
     return [seed_offset + i for i in range(num_seeds)]
+
+
+def _parse_vqbr_optimizer_names(raw: str) -> List[str]:
+    tokens = [x.strip().upper() for x in raw.split(",") if x.strip()]
+    if not tokens:
+        raise ValueError("--vqbr-optimizer must include at least one optimizer name.")
+
+    valid = {str(setting["optimizer"]).upper() for setting in VQBR_OPTIMIZER_SETTINGS}
+    invalid = sorted({token for token in tokens if token not in valid})
+    if invalid:
+        raise ValueError(
+            "Unsupported --vqbr-optimizer values: "
+            f"{', '.join(invalid)}. Supported values: {', '.join(sorted(valid))}."
+        )
+
+    unique_tokens: List[str] = []
+    for token in tokens:
+        if token not in unique_tokens:
+            unique_tokens.append(token)
+    return unique_tokens
+
+
+def _select_vqbr_optimizer_settings(raw: str) -> List[Dict[str, Any]]:
+    selected_optimizer_names = _parse_vqbr_optimizer_names(raw)
+    settings_by_optimizer = {
+        str(setting["optimizer"]).upper(): setting for setting in VQBR_OPTIMIZER_SETTINGS
+    }
+    return [settings_by_optimizer[name] for name in selected_optimizer_names]
+
+
+def _normalize_vqbr_loss(raw: str) -> str:
+    mode = str(raw).strip().lower()
+    aliases = {
+        "log_ratio": "log_ratio",
+        "log": "log_ratio",
+        "neg_ratio": "neg_ratio",
+        "ratio": "neg_ratio",
+        "raw_ratio": "neg_ratio",
+    }
+    resolved = aliases.get(mode)
+    if resolved is None:
+        raise ValueError(
+            "Unsupported --vqbr-loss value. Supported values: "
+            "log_ratio, neg_ratio (aliases: log, ratio, raw_ratio)."
+        )
+    return resolved
+
+
+def _parse_vqbr_su2_gates(raw: str) -> List[str]:
+    gates = [token.strip().lower() for token in str(raw).split(",") if token.strip()]
+    if not gates:
+        raise ValueError("--vqbr-su2-gates must include at least one gate name.")
+    return gates
+
+
+def _parse_int_grid(raw: str, *, arg_name: str) -> List[int]:
+    tokens = [x.strip() for x in str(raw).split(",") if x.strip()]
+    if not tokens:
+        raise ValueError(f"{arg_name} must include at least one integer value.")
+    values: List[int] = []
+    for token in tokens:
+        value = int(token)
+        if value <= 0:
+            raise ValueError(f"{arg_name} values must be strictly positive; got {value}.")
+        values.append(value)
+
+    unique: List[int] = []
+    for value in values:
+        if value not in unique:
+            unique.append(value)
+    return unique
+
+
+def _parse_str_grid(raw: str, *, arg_name: str) -> List[str]:
+    tokens = [x.strip() for x in str(raw).split(",") if x.strip()]
+    if not tokens:
+        raise ValueError(f"{arg_name} must include at least one value.")
+    unique: List[str] = []
+    for token in tokens:
+        if token not in unique:
+            unique.append(token)
+    return unique
+
+
+def _parse_vqbr_su2_gates_grid(raw: str) -> List[Tuple[str, ...]]:
+    text = str(raw).strip()
+    if text == "":
+        raise ValueError("--vqbr-su2-gates-grid must include at least one gate set.")
+    group_tokens = [tok.strip() for tok in re.split(r"[;|]", text) if tok.strip()]
+    if not group_tokens:
+        raise ValueError("--vqbr-su2-gates-grid must include at least one gate set.")
+
+    groups: List[Tuple[str, ...]] = []
+    for token in group_tokens:
+        gates = tuple(_parse_vqbr_su2_gates(token))
+        if gates not in groups:
+            groups.append(gates)
+    return groups
+
+
+def _parse_vqbr_loss_grid(raw: str) -> List[str]:
+    tokens = [x.strip() for x in str(raw).split(",") if x.strip()]
+    if not tokens:
+        raise ValueError("--vqbr-loss-grid must include at least one loss value.")
+
+    values: List[str] = []
+    for token in tokens:
+        normalized = _normalize_vqbr_loss(token)
+        if normalized not in values:
+            values.append(normalized)
+    return values
+
+
+def _format_su2_gates(gates: Tuple[str, ...]) -> str:
+    return ",".join(str(g) for g in gates)
+
+
+def _grid_config_to_dict(config: VQBRGridConfig) -> Dict[str, Any]:
+    return {
+        "config_id": str(config.config_id),
+        "optimizer": "COBYLA",
+        "shots": int(config.shots),
+        "maxiter": int(config.maxiter),
+        "reps": int(config.reps),
+        "su2_gates": [str(g) for g in config.su2_gates],
+        "su2_gates_text": _format_su2_gates(config.su2_gates),
+        "entanglement": str(config.entanglement),
+        "loss": str(config.loss),
+    }
+
+
+def _build_vqbr_grid_configs(args: argparse.Namespace) -> List[VQBRGridConfig]:
+    shots_grid = _parse_int_grid(args.vqbr_shots_grid, arg_name="--vqbr-shots-grid")
+    maxiter_grid = _parse_int_grid(args.vqbr_maxiter_grid, arg_name="--vqbr-maxiter-grid")
+    reps_grid = _parse_int_grid(args.vqbr_reps_grid, arg_name="--vqbr-reps-grid")
+    su2_grid = _parse_vqbr_su2_gates_grid(args.vqbr_su2_gates_grid)
+    entanglement_grid = _parse_str_grid(
+        args.vqbr_entanglement_grid,
+        arg_name="--vqbr-entanglement-grid",
+    )
+    loss_grid = _parse_vqbr_loss_grid(args.vqbr_loss_grid)
+
+    grid_configs: List[VQBRGridConfig] = []
+    for idx, (shots, maxiter, reps, su2_gates, entanglement, loss) in enumerate(
+        itertools.product(
+            shots_grid,
+            maxiter_grid,
+            reps_grid,
+            su2_grid,
+            entanglement_grid,
+            loss_grid,
+        ),
+        start=1,
+    ):
+        grid_configs.append(
+            VQBRGridConfig(
+                config_id=f"cfg_{idx:04d}",
+                shots=int(shots),
+                maxiter=int(maxiter),
+                reps=int(reps),
+                su2_gates=tuple(str(g).lower() for g in su2_gates),
+                entanglement=str(entanglement),
+                loss=str(loss),
+            )
+        )
+    return grid_configs
 
 
 def _load_energy_dataset(dataset_path: Path, target_col: str) -> tuple[np.ndarray, np.ndarray, List[str]]:
@@ -368,15 +654,16 @@ def _evaluate_vqbr_metrics(
     y_test_pred = np.asarray(X_test, dtype=float) @ np.asarray(
         reconstructed_vector, dtype=float
     ) + float(y_train_mean)
+    w_star_arr = np.asarray(w_star, dtype=float)
+    reconstruction_arr = np.asarray(reconstructed_vector, dtype=float)
+    w_star_norm = float(np.linalg.norm(w_star_arr))
+    relative_l2_distance = float(
+        np.linalg.norm(reconstruction_arr - w_star_arr) / max(w_star_norm, EPS)
+    )
 
     return {
         "cosine_similarity": _safe_cosine(reconstructed_vector, w_star),
-        "euclidean_distance": float(
-            np.linalg.norm(
-                np.asarray(reconstructed_vector, dtype=float)
-                - np.asarray(w_star, dtype=float)
-            )
-        ),
+        "relative_l2_distance": relative_l2_distance,
         "train_mse": _mse(y_train_raw, y_train_pred),
         "test_mse": _mse(y_test_raw, y_test_pred),
         "batch_L_hat": float(final_batch_L_hat),
@@ -384,7 +671,7 @@ def _evaluate_vqbr_metrics(
         "batch_loss_history": [float(x) for x in batch_loss_history],
         # Kept for backward compatibility with older plotting helpers.
         "loss_history": [float(x) for x in batch_loss_history],
-        "closed_form_norm": float(np.linalg.norm(w_star)),
+        "closed_form_norm": w_star_norm,
         "encoding_vector": [float(x) for x in np.asarray(encoding_vector, dtype=float)],
         "reconstructed_vector": [
             float(x) for x in np.asarray(reconstructed_vector, dtype=float)
@@ -492,8 +779,10 @@ def _resolve_vqbr_optimizer_configs(
     if args.vqbr_batch_size <= 0:
         raise ValueError("--vqbr-batch-size must be positive.")
 
+    selected_settings = _select_vqbr_optimizer_settings(args.vqbr_optimizer)
+
     configs: List[Dict[str, Any]] = []
-    for setting in VQBR_OPTIMIZER_SETTINGS:
+    for setting in selected_settings:
         use_full_batch = bool(setting["use_full_batch"])
         if use_full_batch:
             batch_size_used = int(n_train_samples)
@@ -577,6 +866,20 @@ def _run_one_seed_one_prior(
     w_star = closed_form.get_weights()
 
     methods: Dict[str, Dict[str, Any]] = {}
+    y_train_pred_closed_form = np.asarray(closed_form.predict(X_train), dtype=float) + float(y_train_mean)
+    y_test_pred_closed_form = np.asarray(closed_form.predict(X_test), dtype=float) + float(y_train_mean)
+    methods["closed_form"] = {
+        "train_mse": _mse(y_train_raw, y_train_pred_closed_form),
+        "test_mse": _mse(y_test_raw, y_test_pred_closed_form),
+    }
+    if args.log_realtime:
+        print(
+            "    "
+            f"[{prior_case}][seed={seed}][closed_form] "
+            f"train_mse={methods['closed_form']['train_mse']:.6f}, "
+            f"test_mse={methods['closed_form']['test_mse']:.6f}",
+            flush=True,
+        )
 
     vqbr_module = importlib.import_module("vqbr")
     VariationalQuantumBayesianRegression = getattr(
@@ -586,6 +889,8 @@ def _run_one_seed_one_prior(
         args=args,
         n_train_samples=int(X_train.shape[0]),
     )
+    vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
+    vqbr_su2_gates = _parse_vqbr_su2_gates(args.vqbr_su2_gates)
     for opt_cfg in optimizer_configs:
         method_key = str(opt_cfg["method_key"])
         optimizer_name = str(opt_cfg["optimizer"])
@@ -598,22 +903,28 @@ def _run_one_seed_one_prior(
                 "    "
                 f"[{prior_case}][seed={seed}][{method_key}] "
                 f"training start: optimizer={optimizer_name}, "
+                f"loss={vqbr_loss}, "
+                f"su2_gates={vqbr_su2_gates}, "
                 f"mode={batch_mode}, batch_size={batch_size_used}, "
                 f"shuffle_batches={shuffle_batches}",
                 flush=True,
             )
 
         vqbr = VariationalQuantumBayesianRegression(
-            shots=args.vqbr_shots,
+            shots=int(getattr(args, "vqbr_shots", 4096)),
             batch_size=batch_size_used,
             reps=args.vqbr_reps,
             optimizer=optimizer_name,
             maxiter=args.vqbr_maxiter,
             shuffle_batches=shuffle_batches,
             learning_rate=args.vqbr_learning_rate,
+            loss=vqbr_loss,
+            su2_gates=vqbr_su2_gates,
             random_state=seed,
             use_shot_noise=args.vqbr_use_shot_noise,
             verbose=args.vqbr_verbose,
+            prefer_gpu=args.vqbr_prefer_gpu,
+            require_gpu=args.vqbr_require_gpu,
         )
         iteration_callback = None
         if args.log_realtime:
@@ -666,6 +977,14 @@ def _run_one_seed_one_prior(
         vqbr_metrics["batch_mode"] = batch_mode
         vqbr_metrics["batch_size_used"] = int(batch_size_used)
         vqbr_metrics["shuffle_batches"] = bool(shuffle_batches)
+        vqbr_metrics["loss"] = str(vqbr_loss)
+        vqbr_metrics["simulator_device"] = str(getattr(vqbr, "simulator_device_", "CPU"))
+        vqbr_metrics["simulator_backend"] = str(
+            getattr(vqbr, "simulator_backend_", "statevector_cpu")
+        )
+        vqbr_metrics["simulator_reason"] = str(
+            getattr(vqbr, "simulator_reason_", "Using CPU statevector simulator.")
+        )
         vqbr_metrics["trained_circuit"] = _serialize_trained_circuit(trained_circuit)
         vqbr_metrics["statevector_source"] = "simulated_from_trained_circuit"
         vqbr_metrics["fit_vs_sim_state_l2"] = fit_vs_sim_l2
@@ -675,8 +994,11 @@ def _run_one_seed_one_prior(
             print(
                 "    "
                 f"[{prior_case}][seed={seed}][{method_key}] "
+                f"simulator={vqbr_metrics['simulator_device']} "
+                f"({vqbr_metrics['simulator_backend']}), "
+                f"reason={vqbr_metrics['simulator_reason']}, "
                 f"cos={vqbr_metrics['cosine_similarity']:.6f}, "
-                f"euclid={vqbr_metrics['euclidean_distance']:.6e}, "
+                f"rel_l2={vqbr_metrics['relative_l2_distance']:.6e}, "
                 f"train_mse={vqbr_metrics['train_mse']:.6f}, "
                 f"test_mse={vqbr_metrics['test_mse']:.6f}, "
                 f"batch_L_hat={vqbr_metrics['batch_L_hat']:.6e}",
@@ -715,13 +1037,350 @@ def _run_one_seed_one_prior(
     }
 
 
+def _prepare_seed_run(
+    *,
+    seed: int,
+    prior_case: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    splits: SplitData,
+    V_grid: np.ndarray,
+    lambda_grid: np.ndarray,
+    args: argparse.Namespace,
+) -> PreparedSeedRun:
+    X_train_raw = X[splits.train_indices]
+    y_train_raw = y[splits.train_indices]
+    X_test_raw = X[splits.test_indices]
+    y_test_raw = y[splits.test_indices]
+
+    X_tune_train_raw = X[splits.train_val_indices]
+    y_tune_train_raw = y[splits.train_val_indices]
+    X_val_raw = X[splits.val_indices]
+    y_val_raw = y[splits.val_indices]
+
+    tune_mean, tune_std = _fit_feature_standardizer(X_tune_train_raw)
+    X_tune_train = _apply_feature_standardizer(X_tune_train_raw, tune_mean, tune_std)
+    X_val = _apply_feature_standardizer(X_val_raw, tune_mean, tune_std)
+    y_tune_mean, y_tune_train_centered = _fit_and_center_target(y_tune_train_raw)
+
+    selected = _select_hyperparameters(
+        prior_case=prior_case,
+        seed=seed,
+        X_train_for_tuning=X_tune_train,
+        y_train_for_tuning_centered=y_tune_train_centered,
+        y_train_for_tuning_mean=y_tune_mean,
+        X_train_for_prior_variance=X_tune_train_raw,
+        X_val=X_val,
+        y_val_raw=y_val_raw,
+        V_grid=V_grid,
+        lambda_grid=lambda_grid,
+        prior_delta=args.prior_delta,
+        log_realtime=args.log_realtime,
+        log_hyperparam_sweep=args.log_hyperparam_sweep,
+    )
+
+    train_mean, train_std = _fit_feature_standardizer(X_train_raw)
+    X_train = _apply_feature_standardizer(X_train_raw, train_mean, train_std)
+    X_test = _apply_feature_standardizer(X_test_raw, train_mean, train_std)
+    y_train_mean, y_train_centered = _fit_and_center_target(y_train_raw)
+
+    m0_train, sigma_diag_train = _build_prior(
+        prior_case=prior_case,
+        X_reference=X_train,
+        lambda_strength=selected["lambda_strength"],
+        delta=args.prior_delta,
+        variance_reference=X_train_raw,
+    )
+    V_selected = float(selected["V"])
+
+    closed_form = ClosedFormMAPBayesianRegression()
+    closed_form.fit(X_train, y_train_centered, m0_train, sigma_diag_train, V_selected)
+    w_star = closed_form.get_weights()
+
+    y_train_pred_closed_form = np.asarray(closed_form.predict(X_train), dtype=float) + float(y_train_mean)
+    y_test_pred_closed_form = np.asarray(closed_form.predict(X_test), dtype=float) + float(y_train_mean)
+    closed_form_metrics = {
+        "train_mse": _mse(y_train_raw, y_train_pred_closed_form),
+        "test_mse": _mse(y_test_raw, y_test_pred_closed_form),
+    }
+    if args.log_realtime:
+        print(
+            "    "
+            f"[{prior_case}][seed={seed}][closed_form] "
+            f"train_mse={closed_form_metrics['train_mse']:.6f}, "
+            f"test_mse={closed_form_metrics['test_mse']:.6f}",
+            flush=True,
+        )
+
+    return PreparedSeedRun(
+        seed=int(seed),
+        split={
+            "n_train_total": int(X_train.shape[0]),
+            "n_train_for_hyperparam": int(X_tune_train.shape[0]),
+            "n_val": int(X_val.shape[0]),
+            "n_test": int(X_test.shape[0]),
+            "train_ratio": float(args.train_ratio),
+            "test_ratio": float(1.0 - args.train_ratio),
+            "val_ratio_within_train": float(args.val_ratio_within_train),
+        },
+        preprocessing={
+            "feature_standardization": {
+                "fitted_on": "outer_train_split",
+                "mean": [float(x) for x in train_mean],
+                "std": [float(x) for x in train_std],
+            },
+            "target_centering": {
+                "fitted_on": "outer_train_split",
+                "mean": float(y_train_mean),
+            },
+        },
+        selected_hyperparameters={
+            "V": float(selected["V"]),
+            "lambda_strength": float(selected["lambda_strength"]),
+            "validation_mse": float(selected["validation_mse"]),
+            "prior_delta": float(args.prior_delta),
+        },
+        X_train=X_train,
+        y_train_raw=y_train_raw,
+        X_test=X_test,
+        y_test_raw=y_test_raw,
+        y_train_centered=y_train_centered,
+        y_train_mean=float(y_train_mean),
+        m0_train=m0_train,
+        sigma_diag_train=sigma_diag_train,
+        V_selected=float(V_selected),
+        w_star=np.asarray(w_star, dtype=float),
+        closed_form_metrics=closed_form_metrics,
+    )
+
+
+def _run_vqbr_for_grid_config(
+    *,
+    prior_case: str,
+    prepared: PreparedSeedRun,
+    config: VQBRGridConfig,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    vqbr_module = importlib.import_module("vqbr")
+    VariationalQuantumBayesianRegression = getattr(
+        vqbr_module, "VariationalQuantumBayesianRegression"
+    )
+
+    method_key = "vqbr_cobyla"
+    optimizer_name = "COBYLA"
+    batch_mode = "full_data"
+    batch_size_used = int(prepared.X_train.shape[0])
+    shuffle_batches = False
+    su2_gates = list(config.su2_gates)
+
+    if args.log_realtime:
+        print(
+            "    "
+            f"[{prior_case}][seed={prepared.seed}][{config.config_id}] "
+            f"training start: optimizer={optimizer_name}, "
+            f"shots={config.shots}, "
+            f"loss={config.loss}, "
+            f"su2_gates={su2_gates}, "
+            f"entanglement={config.entanglement}, "
+            f"reps={config.reps}, "
+            f"maxiter={config.maxiter}",
+            flush=True,
+        )
+
+    vqbr = VariationalQuantumBayesianRegression(
+        shots=config.shots,
+        batch_size=batch_size_used,
+        reps=config.reps,
+        optimizer=optimizer_name,
+        maxiter=config.maxiter,
+        shuffle_batches=shuffle_batches,
+        learning_rate=args.vqbr_learning_rate,
+        loss=config.loss,
+        su2_gates=su2_gates,
+        entanglement=config.entanglement,
+        random_state=prepared.seed,
+        use_shot_noise=args.vqbr_use_shot_noise,
+        verbose=args.vqbr_verbose,
+        prefer_gpu=args.vqbr_prefer_gpu,
+        require_gpu=args.vqbr_require_gpu,
+    )
+    iteration_callback = None
+    if args.log_realtime:
+        iteration_callback = _make_vqbr_iteration_logger(
+            prior_case=prior_case,
+            seed=prepared.seed,
+            method_key=f"{method_key}:{config.config_id}",
+            optimizer=optimizer_name,
+            batch_mode=batch_mode,
+            batch_size=batch_size_used,
+            log_every_iter=args.log_every_iter,
+        )
+    fitted_state = vqbr.fit(
+        prepared.X_train,
+        prepared.y_train_centered,
+        prepared.m0_train,
+        prepared.sigma_diag_train,
+        prepared.V_selected,
+        iteration_callback=iteration_callback,
+    )
+    trained_circuit = _build_trained_circuit(vqbr)
+    statevector_from_circuit = _simulate_statevector_from_circuit(trained_circuit)
+
+    fit_state = np.asarray(fitted_state, dtype=complex).reshape(-1)
+    overlap = np.vdot(statevector_from_circuit, fit_state)
+    phase = np.exp(-1j * np.angle(overlap)) if np.abs(overlap) > EPS else 1.0 + 0.0j
+    fit_state_aligned = fit_state * phase
+    fit_vs_sim_l2 = float(np.linalg.norm(fit_state_aligned - statevector_from_circuit))
+
+    reconstructed_vector, encoding_vector = _reconstruct_vqbr_vector_from_state(
+        statevector_from_circuit,
+        w_star=prepared.w_star,
+    )
+    batch_loss_history = _collect_batch_loss_history(vqbr.history_)
+    finite_batch_losses = [x for x in batch_loss_history if np.isfinite(x)]
+    final_batch_L_hat = finite_batch_losses[-1] if finite_batch_losses else float("nan")
+    vqbr_metrics = _evaluate_vqbr_metrics(
+        reconstructed_vector=reconstructed_vector,
+        encoding_vector=encoding_vector,
+        w_star=prepared.w_star,
+        X_train=prepared.X_train,
+        y_train_raw=prepared.y_train_raw,
+        X_test=prepared.X_test,
+        y_test_raw=prepared.y_test_raw,
+        y_train_mean=prepared.y_train_mean,
+        final_batch_L_hat=final_batch_L_hat,
+        batch_loss_history=batch_loss_history,
+    )
+    vqbr_metrics["optimizer"] = optimizer_name
+    vqbr_metrics["batch_mode"] = batch_mode
+    vqbr_metrics["batch_size_used"] = int(batch_size_used)
+    vqbr_metrics["shuffle_batches"] = bool(shuffle_batches)
+    vqbr_metrics["shots"] = int(config.shots)
+    vqbr_metrics["loss"] = str(config.loss)
+    vqbr_metrics["su2_gates"] = [str(g) for g in su2_gates]
+    vqbr_metrics["entanglement"] = str(config.entanglement)
+    vqbr_metrics["reps"] = int(config.reps)
+    vqbr_metrics["maxiter"] = int(config.maxiter)
+    vqbr_metrics["config_id"] = str(config.config_id)
+    vqbr_metrics["simulator_device"] = str(getattr(vqbr, "simulator_device_", "CPU"))
+    vqbr_metrics["simulator_backend"] = str(
+        getattr(vqbr, "simulator_backend_", "statevector_cpu")
+    )
+    vqbr_metrics["simulator_reason"] = str(
+        getattr(vqbr, "simulator_reason_", "Using CPU statevector simulator.")
+    )
+    vqbr_metrics["fit_vs_sim_state_l2"] = fit_vs_sim_l2
+    # Keep JSON artifacts compact when sweeping many configurations.
+    vqbr_metrics.pop("encoding_vector", None)
+    vqbr_metrics.pop("reconstructed_vector", None)
+
+    if args.log_realtime:
+        print(
+            "    "
+            f"[{prior_case}][seed={prepared.seed}][{config.config_id}] "
+            f"simulator={vqbr_metrics['simulator_device']} "
+            f"({vqbr_metrics['simulator_backend']}), "
+            f"cos={vqbr_metrics['cosine_similarity']:.6f}, "
+            f"rel_l2={vqbr_metrics['relative_l2_distance']:.6e}, "
+            f"train_mse={vqbr_metrics['train_mse']:.6f}, "
+            f"test_mse={vqbr_metrics['test_mse']:.6f}, "
+            f"batch_L_hat={vqbr_metrics['batch_L_hat']:.6e}",
+            flush=True,
+        )
+    return vqbr_metrics
+
+
+def _compact_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def _aggregate_metric(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {"mean": float("nan"), "std": float("nan")}
+    arr = np.asarray(values, dtype=float)
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr, ddof=0)),
+    }
+
+
+def _aggregate_closed_form_results(seed_runs: List[PreparedSeedRun]) -> Dict[str, Dict[str, float]]:
+    return {
+        "train_mse": _aggregate_metric(
+            [float(seed_run.closed_form_metrics["train_mse"]) for seed_run in seed_runs]
+        ),
+        "test_mse": _aggregate_metric(
+            [float(seed_run.closed_form_metrics["test_mse"]) for seed_run in seed_runs]
+        ),
+    }
+
+
+def _build_training_row(
+    *,
+    prior_case: str,
+    prepared: PreparedSeedRun,
+    config: VQBRGridConfig,
+    vqbr_metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "prior_case": str(prior_case),
+        "seed": int(prepared.seed),
+        "config_id": str(config.config_id),
+        "optimizer": "COBYLA",
+        "shots": int(config.shots),
+        "maxiter": int(config.maxiter),
+        "reps": int(config.reps),
+        "su2_gates": _format_su2_gates(config.su2_gates),
+        "entanglement": str(config.entanglement),
+        "loss": str(config.loss),
+        "n_train_total": int(prepared.split["n_train_total"]),
+        "n_train_for_hyperparam": int(prepared.split["n_train_for_hyperparam"]),
+        "n_val": int(prepared.split["n_val"]),
+        "n_test": int(prepared.split["n_test"]),
+        "train_ratio": float(prepared.split["train_ratio"]),
+        "val_ratio_within_train": float(prepared.split["val_ratio_within_train"]),
+        "selected_V": float(prepared.selected_hyperparameters["V"]),
+        "selected_lambda_strength": float(prepared.selected_hyperparameters["lambda_strength"]),
+        "selected_validation_mse": float(prepared.selected_hyperparameters["validation_mse"]),
+        "closed_form_train_mse": float(prepared.closed_form_metrics["train_mse"]),
+        "closed_form_test_mse": float(prepared.closed_form_metrics["test_mse"]),
+        "cosine_similarity": float(vqbr_metrics["cosine_similarity"]),
+        "relative_l2_distance": float(vqbr_metrics["relative_l2_distance"]),
+        "train_mse": float(vqbr_metrics["train_mse"]),
+        "test_mse": float(vqbr_metrics["test_mse"]),
+        "batch_L_hat": float(vqbr_metrics["batch_L_hat"]),
+        "iterations": int(vqbr_metrics["iterations"]),
+        "fit_vs_sim_state_l2": float(vqbr_metrics.get("fit_vs_sim_state_l2", np.nan)),
+        "simulator_device": str(vqbr_metrics.get("simulator_device", "CPU")),
+        "simulator_backend": str(vqbr_metrics.get("simulator_backend", "statevector_cpu")),
+        "simulator_reason": str(
+            vqbr_metrics.get("simulator_reason", "Using CPU statevector simulator.")
+        ),
+        "batch_loss_history_json": _compact_json_dumps(vqbr_metrics.get("batch_loss_history", [])),
+    }
+
+
 def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     dataset_path = Path(args.dataset_path).resolve()
     output_path = Path(args.output_path).resolve()
+    training_csv_path = Path(args.training_csv_path).resolve()
+    summary_csv_path = Path(args.summary_csv_path).resolve()
+    raw_log_file_path = str(getattr(args, "log_file_path", "")).strip()
+    resolved_log_file_path = (
+        str(Path(raw_log_file_path).resolve()) if raw_log_file_path != "" else ""
+    )
+
     if args.log_every_iter <= 0:
         raise ValueError("--log-every-iter must be a positive integer.")
     if args.vqbr_batch_size <= 0:
         raise ValueError("--vqbr-batch-size must be a positive integer.")
+
+    optimizer = str(args.vqbr_optimizer).strip().upper()
+    if optimizer != "COBYLA":
+        raise ValueError(
+            "This grid-search experiment currently fixes the optimizer to COBYLA. "
+            f"Received --vqbr-optimizer={args.vqbr_optimizer!r}."
+        )
 
     seeds = _resolve_seeds(
         num_seeds=args.num_seeds,
@@ -730,6 +1389,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     )
     V_grid = _parse_float_grid(args.V_grid)
     lambda_grid = _parse_float_grid(args.lambda_grid)
+    grid_configs = _build_vqbr_grid_configs(args)
+    grid_config_dicts = [_grid_config_to_dict(cfg) for cfg in grid_configs]
 
     X, y, feature_cols = _load_energy_dataset(dataset_path=dataset_path, target_col=args.target_col)
     n_samples, n_features = X.shape
@@ -751,36 +1412,33 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             "V_grid": [float(x) for x in V_grid],
             "lambda_grid": [float(x) for x in lambda_grid],
             "prior_delta": float(args.prior_delta),
-            "methods": list(METHOD_KEYS),
+            "methods": ["closed_form", "vqbr_cobyla"],
             "vqbr": {
-                "shots": int(args.vqbr_shots),
+                "optimizer": "COBYLA",
                 "batch_size": int(args.vqbr_batch_size),
-                "reps": int(args.vqbr_reps),
-                "maxiter": int(args.vqbr_maxiter),
-                "shuffle_batches": bool(args.vqbr_shuffle_batches),
                 "learning_rate": float(args.vqbr_learning_rate),
                 "use_shot_noise": bool(args.vqbr_use_shot_noise),
-                "optimizers": [
-                    {
-                        "method_key": "vqbr_cobyla",
-                        "optimizer": "COBYLA",
-                        "batch_mode": "full_data",
-                        "batch_size": "n_train_total",
-                        "shuffle_batches": False,
-                    },
-                    {
-                        "method_key": "vqbr_spsa",
-                        "optimizer": "SPSA",
-                        "batch_mode": "mini_batch",
-                        "batch_size": int(args.vqbr_batch_size),
-                        "shuffle_batches": bool(args.vqbr_shuffle_batches),
-                    },
-                ],
+                "prefer_gpu": bool(args.vqbr_prefer_gpu),
+                "require_gpu": bool(args.vqbr_require_gpu),
+                "grid": {
+                    "num_configurations": int(len(grid_configs)),
+                    "shots_grid": sorted({int(cfg.shots) for cfg in grid_configs}),
+                    "maxiter_grid": sorted({int(cfg.maxiter) for cfg in grid_configs}),
+                    "reps_grid": sorted({int(cfg.reps) for cfg in grid_configs}),
+                    "su2_gates_grid": [
+                        token.split(",")
+                        for token in sorted({_format_su2_gates(cfg.su2_gates) for cfg in grid_configs})
+                    ],
+                    "entanglement_grid": sorted({str(cfg.entanglement) for cfg in grid_configs}),
+                    "loss_grid": sorted({str(cfg.loss) for cfg in grid_configs}),
+                    "configs": grid_config_dicts,
+                },
             },
             "logging": {
                 "realtime": bool(args.log_realtime),
                 "log_every_iter": int(args.log_every_iter),
                 "log_hyperparam_sweep": bool(args.log_hyperparam_sweep),
+                "log_file_path": resolved_log_file_path,
             },
             "preprocessing": {
                 "feature_standardization": True,
@@ -789,61 +1447,57 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             },
         },
         "prior_cases": {},
+        "csv_outputs": {
+            "training_info_path": str(training_csv_path),
+            "summary_path": str(summary_csv_path),
+        },
     }
 
-    print("=== Energy Experiment ===")
+    print("=== Energy Experiment (Grid Search) ===")
     print(f"Dataset: {dataset_path}")
     print(f"Target: {args.target_col}")
     print(f"Shape: N={n_samples}, D={n_features}")
     print(f"Seeds ({len(seeds)}): {seeds}")
     print(f"Train/Test split: {args.train_ratio:.2f}/{1.0 - args.train_ratio:.2f}")
     print(f"Inner validation ratio (within train): {args.val_ratio_within_train:.2f}")
-    print("VQBR config:")
+    print("VQBR fixed settings:")
     print(
         "  "
-        f"shots={int(args.vqbr_shots)}, "
-        f"batch_size={int(args.vqbr_batch_size)}, "
-        f"reps={int(args.vqbr_reps)}, "
-        f"maxiter={int(args.vqbr_maxiter)}"
-    )
-    print("  optimizer runs:")
-    print(
-        "    "
-        "vqbr_cobyla: optimizer=COBYLA, mode=full_data, "
-        "batch_size=n_train_total, shuffle_batches=False"
-    )
-    print(
-        "    "
-        f"vqbr_spsa: optimizer=SPSA, mode=mini_batch, "
-        f"batch_size=min({int(args.vqbr_batch_size)}, n_train_total), "
-        f"shuffle_batches={bool(args.vqbr_shuffle_batches)}"
-    )
-    print(
-        "  "
-        f"shuffle_batches={bool(args.vqbr_shuffle_batches)}, "
-        f"learning_rate={float(args.vqbr_learning_rate):.6g}"
-    )
-    print(
-        "  "
+        f"optimizer=COBYLA, "
+        f"learning_rate={float(args.vqbr_learning_rate):.6g}, "
         f"use_shot_noise={bool(args.vqbr_use_shot_noise)}, "
-        f"verbose={bool(args.vqbr_verbose)}, "
-        f"log_every_iter={int(args.log_every_iter)}"
+        f"prefer_gpu={bool(args.vqbr_prefer_gpu)}, "
+        f"require_gpu={bool(args.vqbr_require_gpu)}"
+    )
+    print(f"VQBR grid size: {len(grid_configs)} configurations")
+    print(
+        "  "
+        f"shots={sorted({int(cfg.shots) for cfg in grid_configs})}, "
+        f"maxiter={sorted({int(cfg.maxiter) for cfg in grid_configs})}, "
+        f"reps={sorted({int(cfg.reps) for cfg in grid_configs})}, "
+        f"entanglement={sorted({str(cfg.entanglement) for cfg in grid_configs})}, "
+        f"loss={sorted({str(cfg.loss) for cfg in grid_configs})}"
     )
     print("")
+
+    training_rows: List[Dict[str, Any]] = []
+    summary_rows: List[Dict[str, Any]] = []
 
     for prior_case in PRIOR_CASES:
         print(f"[Prior case: {prior_case}]")
         case_seed_results: List[Dict[str, Any]] = []
+        prepared_seed_runs: List[PreparedSeedRun] = []
+        grid_metric_store: Dict[str, List[Dict[str, Any]]] = {cfg.config_id: [] for cfg in grid_configs}
 
-        for i, seed in enumerate(seeds, start=1):
-            print(f"  Seed {seed} ({i}/{len(seeds)})", flush=True)
+        for seed_index, seed in enumerate(seeds, start=1):
+            print(f"  Seed {seed} ({seed_index}/{len(seeds)})", flush=True)
             splits = _make_splits(
                 n_samples=n_samples,
                 train_ratio=args.train_ratio,
                 val_ratio_within_train=args.val_ratio_within_train,
                 seed=seed,
             )
-            seed_result = _run_one_seed_one_prior(
+            prepared = _prepare_seed_run(
                 seed=seed,
                 prior_case=prior_case,
                 X=X,
@@ -853,27 +1507,166 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
                 lambda_grid=lambda_grid,
                 args=args,
             )
-            case_seed_results.append(seed_result)
+            prepared_seed_runs.append(prepared)
 
+            seed_grid_results: List[Dict[str, Any]] = []
+            for cfg_index, cfg in enumerate(grid_configs, start=1):
+                print(
+                    "    "
+                    f"Config {cfg_index:>4d}/{len(grid_configs)}: {cfg.config_id} "
+                    f"(shots={cfg.shots}, maxiter={cfg.maxiter}, reps={cfg.reps}, "
+                    f"su2_gates={_format_su2_gates(cfg.su2_gates)}, "
+                    f"entanglement={cfg.entanglement}, loss={cfg.loss})",
+                    flush=True,
+                )
+                vqbr_metrics = _run_vqbr_for_grid_config(
+                    prior_case=prior_case,
+                    prepared=prepared,
+                    config=cfg,
+                    args=args,
+                )
+                grid_metric_store[cfg.config_id].append(vqbr_metrics)
+                training_rows.append(
+                    _build_training_row(
+                        prior_case=prior_case,
+                        prepared=prepared,
+                        config=cfg,
+                        vqbr_metrics=vqbr_metrics,
+                    )
+                )
+
+                metrics_for_json = dict(vqbr_metrics)
+                metrics_for_json.pop("batch_loss_history", None)
+                metrics_for_json.pop("loss_history", None)
+                seed_grid_results.append(
+                    {
+                        "config_id": cfg.config_id,
+                        "config": _grid_config_to_dict(cfg),
+                        "methods": {"vqbr_cobyla": metrics_for_json},
+                    }
+                )
+
+            case_seed_results.append(
+                {
+                    "seed": int(seed),
+                    "split": prepared.split,
+                    "preprocessing": prepared.preprocessing,
+                    "selected_hyperparameters": prepared.selected_hyperparameters,
+                    "methods": {"closed_form": prepared.closed_form_metrics},
+                    "grid_results": seed_grid_results,
+                }
+            )
+
+        closed_form_aggregate = _aggregate_closed_form_results(prepared_seed_runs)
+        grid_aggregate: List[Dict[str, Any]] = []
+        metric_keys = (
+            "cosine_similarity",
+            "relative_l2_distance",
+            "train_mse",
+            "test_mse",
+            "batch_L_hat",
+            "iterations",
+        )
+        for cfg in grid_configs:
+            runs = grid_metric_store[cfg.config_id]
+            metric_aggregate = {
+                metric: _aggregate_metric([float(run[metric]) for run in runs if metric in run])
+                for metric in metric_keys
+            }
+            grid_aggregate.append(
+                {
+                    "config_id": cfg.config_id,
+                    "config": _grid_config_to_dict(cfg),
+                    "methods": {"vqbr_cobyla": metric_aggregate},
+                }
+            )
+            summary_row: Dict[str, Any] = {
+                "prior_case": str(prior_case),
+                "config_id": str(cfg.config_id),
+                "optimizer": "COBYLA",
+                "shots": int(cfg.shots),
+                "maxiter": int(cfg.maxiter),
+                "reps": int(cfg.reps),
+                "su2_gates": _format_su2_gates(cfg.su2_gates),
+                "entanglement": str(cfg.entanglement),
+                "loss": str(cfg.loss),
+                "num_seeds": int(len(runs)),
+                "closed_form_train_mse_mean": float(closed_form_aggregate["train_mse"]["mean"]),
+                "closed_form_train_mse_std": float(closed_form_aggregate["train_mse"]["std"]),
+                "closed_form_test_mse_mean": float(closed_form_aggregate["test_mse"]["mean"]),
+                "closed_form_test_mse_std": float(closed_form_aggregate["test_mse"]["std"]),
+            }
+            for metric in metric_keys:
+                summary_row[f"{metric}_mean"] = float(metric_aggregate[metric]["mean"])
+                summary_row[f"{metric}_std"] = float(metric_aggregate[metric]["std"])
+            summary_rows.append(summary_row)
+
+        grid_aggregate.sort(
+            key=lambda x: float(
+                x["methods"]["vqbr_cobyla"].get("test_mse", {}).get("mean", float("inf"))
+            )
+        )
         result["prior_cases"][prior_case] = {
             "per_seed": case_seed_results,
-            "aggregate": _aggregate_case_results(case_seed_results),
+            "closed_form_aggregate": closed_form_aggregate,
+            "grid_aggregate": grid_aggregate,
         }
         print("")
 
+    training_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_csv_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    training_df = pd.DataFrame(training_rows)
+    if not training_df.empty:
+        training_df = training_df.sort_values(
+            by=["prior_case", "config_id", "seed"],
+            kind="stable",
+        ).reset_index(drop=True)
+    training_df.to_csv(training_csv_path, index=False)
+
+    summary_df = pd.DataFrame(summary_rows)
+    if not summary_df.empty:
+        summary_df = summary_df.sort_values(
+            by=["prior_case", "test_mse_mean", "config_id"],
+            kind="stable",
+        ).reset_index(drop=True)
+        summary_df["rank_by_test_mse"] = (
+            summary_df.groupby("prior_case")["test_mse_mean"]
+            .rank(method="first", ascending=True)
+            .astype(int)
+        )
+        first_cols = [
+            "prior_case",
+            "rank_by_test_mse",
+            "config_id",
+            "optimizer",
+            "shots",
+            "maxiter",
+            "reps",
+            "su2_gates",
+            "entanglement",
+            "loss",
+            "num_seeds",
+        ]
+        remaining_cols = [c for c in summary_df.columns if c not in first_cols]
+        summary_df = summary_df[first_cols + remaining_cols]
+    summary_df.to_csv(summary_csv_path, index=False)
+
     with output_path.open("w", encoding="utf-8") as f:
         json.dump(result, f, indent=args.json_indent)
 
-    print(f"Saved results to: {output_path}")
+    print(f"Saved JSON results to: {output_path}")
+    print(f"Saved training CSV to: {training_csv_path}")
+    print(f"Saved summary CSV to: {summary_csv_path}")
     return result
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run closed-form and VQBR on "
-            "ENB2012_data.xlsx with 80/20 train/test splits over multiple seeds."
+            "Run energy-dataset VQBR grid search (fixed optimizer: COBYLA) "
+            "with train/test splits over multiple random seeds."
         )
     )
     parser.add_argument(
@@ -906,26 +1699,71 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prior-delta", type=float, default=1e-8)
 
-    parser.add_argument("--vqbr-shots", type=int, default=4096)
-    parser.add_argument("--vqbr-batch-size", type=int, default=100)
-    parser.add_argument("--vqbr-reps", type=int, default=2)
+    parser.add_argument(
+        "--vqbr-shots-grid",
+        type=str,
+        default="256,512,1024,2048,4096,8192,16384,32768",
+        help="Comma-separated measurement-shot grid.",
+    )
+    parser.add_argument(
+        "--vqbr-batch-size",
+        type=int,
+        default=100,
+        help="Retained for compatibility; COBYLA runs in full-data mode and ignores this value.",
+    )
     parser.add_argument(
         "--vqbr-optimizer",
+        "--vqbr-optimizers",
+        dest="vqbr_optimizer",
         type=str,
-        default="COBYLA,SPSA",
+        default="COBYLA",
+        help="Optimizer is fixed to COBYLA for this grid-search script.",
+    )
+    parser.add_argument("--vqbr-learning-rate", type=float, default=0.05)
+    parser.add_argument(
+        "--vqbr-maxiter-grid",
+        type=str,
+        default="50,100,200,300,400,800,1000,2000",
+        help="Comma-separated maxiter grid.",
+    )
+    parser.add_argument(
+        "--vqbr-reps-grid",
+        type=str,
+        default="1,2,3,4,5,6,7,8",
+        help="Comma-separated EfficientSU2 reps grid.",
+    )
+    parser.add_argument(
+        "--vqbr-su2-gates-grid",
+        type=str,
+        default="ry;rx,y",
         help=(
-            "Deprecated. This script always runs both optimizers: "
-            "COBYLA (full-data iterations) and SPSA (mini-batch iterations)."
+            "Semicolon-separated list of SU(2) gate sets. "
+            "Each set uses comma-separated gate names (example: 'ry;rx,y')."
         ),
     )
-    parser.add_argument("--vqbr-maxiter", type=int, default=200)
-    parser.add_argument("--vqbr-shuffle-batches", action="store_true")
-    parser.add_argument("--no-vqbr-shuffle-batches", dest="vqbr_shuffle_batches", action="store_false")
-    parser.set_defaults(vqbr_shuffle_batches=True)
-    parser.add_argument("--vqbr-learning-rate", type=float, default=0.05)
+    parser.add_argument(
+        "--vqbr-entanglement-grid",
+        type=str,
+        default="full,linear,reverse_linear,pairwise,circular,sca",
+        help="Comma-separated entanglement grid for EfficientSU2.",
+    )
+    parser.add_argument(
+        "--vqbr-loss-grid",
+        type=str,
+        default="log_ratio,neg_ratio",
+        help="Comma-separated VQBR loss grid (log_ratio, neg_ratio).",
+    )
     parser.add_argument("--vqbr-use-shot-noise", action="store_true")
     parser.add_argument("--no-vqbr-shot-noise", dest="vqbr_use_shot_noise", action="store_false")
     parser.set_defaults(vqbr_use_shot_noise=True)
+    parser.add_argument("--vqbr-prefer-gpu", action="store_true")
+    parser.add_argument("--no-vqbr-prefer-gpu", dest="vqbr_prefer_gpu", action="store_false")
+    parser.set_defaults(vqbr_prefer_gpu=True)
+    parser.add_argument(
+        "--vqbr-require-gpu",
+        action="store_true",
+        help="Fail fast if GPU statevector simulation cannot be enabled.",
+    )
     parser.add_argument("--vqbr-verbose", action="store_true")
 
     parser.add_argument("--log-realtime", action="store_true")
@@ -948,6 +1786,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=str(ROOT_DIR / "results" / "energy" / "energy_experiment_results.json"),
     )
+    parser.add_argument(
+        "--training-csv-path",
+        type=str,
+        default=str(ROOT_DIR / "results" / "energy" / "energy_grid_training_info.csv"),
+    )
+    parser.add_argument(
+        "--summary-csv-path",
+        type=str,
+        default=str(ROOT_DIR / "results" / "energy" / "energy_grid_summary.csv"),
+    )
+    parser.add_argument(
+        "--log-file-path",
+        type=str,
+        default=str(ROOT_DIR / "results" / "energy" / "energy_grid_run.log"),
+        help="Mirror all console output (stdout and stderr) into this log file.",
+    )
     parser.add_argument("--json-indent", type=int, default=2)
     return parser
 
@@ -955,7 +1809,26 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    run_experiment(args)
+    raw_log_path = str(args.log_file_path).strip()
+    if raw_log_path == "":
+        run_experiment(args)
+        return
+
+    log_path = Path(raw_log_path).resolve()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+        sys.stdout = _TeeStream([original_stdout, log_file])
+        sys.stderr = _TeeStream([original_stderr, log_file])
+        try:
+            print(f"Logging to: {log_path}", flush=True)
+            run_experiment(args)
+        finally:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 if __name__ == "__main__":

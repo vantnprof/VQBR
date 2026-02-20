@@ -1,0 +1,16 @@
+{
+  "pair_name": "N16_D8",
+  "seed": 11,
+  "N": 16,
+  "D": 8,
+  "d": 3,
+  "padded_dim": 8,
+  "train_ratio": 0.8,
+  "test_ratio": 0.19999999999999996,
+  "n_train": 12,
+  "n_test": 4,
+  "noise_std": 0.1,
+  "train_file": "train.npz",
+  "test_file": "test.npz",
+  "params_file": "params.npz"
+}

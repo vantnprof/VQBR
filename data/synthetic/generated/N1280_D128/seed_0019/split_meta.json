@@ -1,0 +1,16 @@
+{
+  "pair_name": "N1280_D128",
+  "seed": 19,
+  "N": 1280,
+  "D": 128,
+  "d": 7,
+  "padded_dim": 128,
+  "train_ratio": 0.8,
+  "test_ratio": 0.19999999999999996,
+  "n_train": 1024,
+  "n_test": 256,
+  "noise_std": 0.1,
+  "train_file": "train.npz",
+  "test_file": "test.npz",
+  "params_file": "params.npz"
+}

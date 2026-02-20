@@ -1,0 +1,16 @@
+{
+  "pair_name": "N32_D16",
+  "seed": 3,
+  "N": 32,
+  "D": 16,
+  "d": 4,
+  "padded_dim": 16,
+  "train_ratio": 0.8,
+  "test_ratio": 0.19999999999999996,
+  "n_train": 25,
+  "n_test": 7,
+  "noise_std": 0.1,
+  "train_file": "train.npz",
+  "test_file": "test.npz",
+  "params_file": "params.npz"
+}

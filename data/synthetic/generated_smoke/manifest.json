@@ -1,0 +1,24 @@
+{
+  "dimensions": [
+    8
+  ],
+  "sample_multipliers": [
+    2
+  ],
+  "pairs": [
+    {
+      "pair_name": "N16_D8",
+      "N": 16,
+      "D": 8,
+      "d": 3,
+      "padded_dim": 8
+    }
+  ],
+  "seeds": [
+    0
+  ],
+  "noise_std": 0.1,
+  "train_ratio": 0.8,
+  "test_ratio": 0.19999999999999996,
+  "notes": "For each pair (N, D), train/test files are generated for the same seed set. X entries are i.i.d standard normal and y = X @ w_true + epsilon with epsilon ~ N(0, sigma^2 I)."
+}

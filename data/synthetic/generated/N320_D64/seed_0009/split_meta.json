@@ -1,0 +1,16 @@
+{
+  "pair_name": "N320_D64",
+  "seed": 9,
+  "N": 320,
+  "D": 64,
+  "d": 6,
+  "padded_dim": 64,
+  "train_ratio": 0.8,
+  "test_ratio": 0.19999999999999996,
+  "n_train": 256,
+  "n_test": 64,
+  "noise_std": 0.1,
+  "train_file": "train.npz",
+  "test_file": "test.npz",
+  "params_file": "params.npz"
+}
