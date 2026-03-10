@@ -1,0 +1,2225 @@
+{
+  "dataset": {
+    "path": "/work/vantn/VQBR/data/real/energy/ENB2012_data.xlsx",
+    "target_col": "Y1",
+    "feature_cols": [
+      "X1",
+      "X2",
+      "X3",
+      "X4",
+      "X5",
+      "X6",
+      "X7",
+      "X8"
+    ],
+    "n_samples": 768,
+    "n_features": 8
+  },
+  "config": {
+    "num_seeds": 20,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "prior_cases": [
+      "heteroscedastic"
+    ],
+    "train_ratio": 0.8,
+    "val_ratio_within_train": 0.1,
+    "V_grid": [
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0
+    ],
+    "lambda_grid": [
+      0.0001,
+      0.001,
+      0.01,
+      0.1,
+      1.0,
+      10.0,
+      100.0
+    ],
+    "prior_delta": 1e-08,
+    "freeze_hyperparams": true,
+    "hyperparam_ref_seed": 0,
+    "global_hyperparams": {
+      "heteroscedastic": {
+        "validation_mse": 10.96452399927251,
+        "V": 0.0001,
+        "lambda_strength": 100.0
+      }
+    },
+    "methods": [
+      "closed_form",
+      "vqbr_cobyla"
+    ],
+    "vqbr": {
+      "optimizer": "COBYLA",
+      "batch_size": 100,
+      "learning_rate": 0.05,
+      "use_shot_noise": true,
+      "prefer_gpu": true,
+      "require_gpu": false,
+      "grid": {
+        "num_configurations": 1,
+        "shots_grid": [
+          1024
+        ],
+        "maxiter_grid": [
+          200
+        ],
+        "reps_grid": [
+          6
+        ],
+        "su2_gates_grid": [
+          [
+            "rx",
+            "y"
+          ]
+        ],
+        "entanglement_grid": [
+          "linear"
+        ],
+        "loss_grid": [
+          "neg_ratio"
+        ],
+        "configs": [
+          {
+            "config_id": "cfg_0001",
+            "optimizer": "COBYLA",
+            "shots": 1024,
+            "maxiter": 200,
+            "reps": 6,
+            "su2_gates": [
+              "rx",
+              "y"
+            ],
+            "su2_gates_text": "rx,y",
+            "entanglement": "linear",
+            "loss": "neg_ratio"
+          }
+        ]
+      }
+    },
+    "logging": {
+      "realtime": true,
+      "log_every_iter": 5,
+      "log_hyperparam_sweep": false,
+      "log_file_path": "/work/vantn/VQBR/results/energy/test.log"
+    },
+    "preprocessing": {
+      "feature_standardization": true,
+      "target_centering": true,
+      "standardization_scope": "fit on training split only, then applied to validation/test"
+    }
+  },
+  "prior_cases": {
+    "heteroscedastic": {
+      "per_seed": [
+        {
+          "seed": 0,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7655374592833886,
+                670.5977198697068,
+                319.45765472312706,
+                175.5700325732899,
+                5.278501628664495,
+                3.477198697068404,
+                0.23477198697068405,
+                2.8094462540716614
+              ],
+              "std": [
+                0.10609574557315643,
+                88.18833615188277,
+                44.427995015299686,
+                45.43960516541184,
+                1.7497678866533892,
+                1.10461040175827,
+                0.1323805963015706,
+                1.5402870051345243
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.4642671009772
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.037485128108024,
+              "test_mse": 10.587362037774618
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.7664137829289783,
+                  "relative_l2_distance": 0.6835001347052123,
+                  "train_mse": 14.163234028431667,
+                  "test_mse": 17.17766113726804,
+                  "batch_L_hat": -56590.248367659944,
+                  "iterations": 200,
+                  "closed_form_norm": 11.150829477523754,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 1,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7604071661237785,
+                674.9470684039088,
+                320.0561889250814,
+                177.44543973941367,
+                5.210097719869707,
+                3.519543973941368,
+                0.23306188925081436,
+                2.8355048859934855
+              ],
+              "std": [
+                0.10542915407253946,
+                88.18112310388074,
+                44.531963623590435,
+                45.232451061612466,
+                1.749545028869039,
+                1.1294585716193404,
+                0.13313951224264423,
+                1.5284415395684547
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.20601954397394
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.171325794894335,
+              "test_mse": 10.020965456874702
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.2822773037558887,
+                  "relative_l2_distance": 1.1981007438810072,
+                  "train_mse": 17.431174587184604,
+                  "test_mse": 20.736292018984763,
+                  "batch_L_hat": -55877.28717605721,
+                  "iterations": 200,
+                  "closed_form_norm": 11.140349636563403,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 2,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7663355048859941,
+                669.9592833876221,
+                319.2581433224756,
+                175.3505700325733,
+                5.289902280130293,
+                3.50814332247557,
+                0.23379478827361583,
+                2.811074918566775
+              ],
+              "std": [
+                0.10622984488652323,
+                88.31830464287319,
+                44.02292181821511,
+                45.36993216645882,
+                1.749545028869039,
+                1.1062888657024572,
+                0.13226452952656456,
+                1.5420726621545418
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.567003257328988
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.28963394895345,
+              "test_mse": 9.535095372352547
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.3306163960113871,
+                  "relative_l2_distance": 1.1570510826999927,
+                  "train_mse": 17.58260615738878,
+                  "test_mse": 16.58896867611025,
+                  "batch_L_hat": -54786.26320863931,
+                  "iterations": 200,
+                  "closed_form_norm": 11.396346846183794,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 3,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.76456026058632,
+                671.3957654723127,
+                318.5399022801303,
+                176.4279315960912,
+                5.25,
+                3.470684039087948,
+                0.23403908794788258,
+                2.817589576547231
+              ],
+              "std": [
+                0.1059195139578429,
+                87.90239561415356,
+                43.69511023698619,
+                45.31415177329751,
+                1.75,
+                1.127804006628548,
+                0.13298491907034204,
+                1.5460204416971417
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.391596091205212
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.355478195790534,
+              "test_mse": 9.555320926943148
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.601049521584541,
+                  "relative_l2_distance": 0.8932530194916323,
+                  "train_mse": 12.28969041764288,
+                  "test_mse": 12.332955391437853,
+                  "batch_L_hat": -57826.63708149473,
+                  "iterations": 200,
+                  "closed_form_norm": 11.609127532102258,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 4,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7607166123778506,
+                674.5081433224756,
+                318.65960912052117,
+                177.9242671009772,
+                5.204397394136808,
+                3.50814332247557,
+                0.23224755700325742,
+                2.804560260586319
+              ],
+              "std": [
+                0.10465613532965762,
+                87.46244851999647,
+                43.30153081048348,
+                44.90644869319822,
+                1.7494057283370406,
+                1.1121620252185118,
+                0.13425205019898626,
+                1.571606385432907
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.058283387622147
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.550571877831436,
+              "test_mse": 8.456832041452188
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.8701917098809997,
+                  "relative_l2_distance": 0.5095258386362761,
+                  "train_mse": 10.732733693933092,
+                  "test_mse": 10.848385009899362,
+                  "batch_L_hat": -55730.63843168886,
+                  "iterations": 200,
+                  "closed_form_norm": 11.424693376185726,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 5,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7634364820846906,
+                672.39332247557,
+                318.3004885993485,
+                177.04641693811075,
+                5.227198697068404,
+                3.503257328990228,
+                0.23289902280130292,
+                2.794788273615635
+              ],
+              "std": [
+                0.10569953900220645,
+                87.99013735283962,
+                43.177014444128815,
+                45.234510227263755,
+                1.7498514510050904,
+                1.1165715654706647,
+                0.13463934053087545,
+                1.5745033457540951
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.088739413680784
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.375751802918764,
+              "test_mse": 9.201737783245356
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.3692018299444018,
+                  "relative_l2_distance": 1.1232080573567818,
+                  "train_mse": 11.045459456695808,
+                  "test_mse": 12.595187607434422,
+                  "batch_L_hat": -53778.18557915326,
+                  "iterations": 200,
+                  "closed_form_norm": 11.063764427330302,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 6,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7665635179153095,
+                669.3607491856677,
+                317.7418566775244,
+                175.80944625407167,
+                5.289902280130293,
+                3.5,
+                0.23851791530944613,
+                2.8566775244299674
+              ],
+              "std": [
+                0.10436756193865229,
+                86.7603765448315,
+                43.822605352434564,
+                44.94692092535997,
+                1.7495450288690386,
+                1.1209436462108415,
+                0.13198898941673196,
+                1.543815877229132
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.606231270358304
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.551030157297442,
+              "test_mse": 8.511714418501635
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.3658237489553893,
+                  "relative_l2_distance": 1.1262115707491296,
+                  "train_mse": 12.018217019832408,
+                  "test_mse": 12.036383028695225,
+                  "batch_L_hat": -54653.003373584856,
+                  "iterations": 200,
+                  "closed_form_norm": 10.998772646568467,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 7,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7621335504885994,
+                673.1115635179153,
+                319.4975570032573,
+                176.807003257329,
+                5.244299674267101,
+                3.51628664495114,
+                0.23110749185667753,
+                2.8355048859934855
+              ],
+              "std": [
+                0.10390192889817847,
+                86.88023982181898,
+                44.040351025641606,
+                45.0358706993819,
+                1.7499907160572368,
+                1.1135361503900767,
+                0.13379238441063285,
+                1.5777287480486317
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.22031921824104
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.897350387790924,
+              "test_mse": 7.146667792083913
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.26249005586145274,
+                  "relative_l2_distance": 1.2145039679956153,
+                  "train_mse": 20.73869514920049,
+                  "test_mse": 21.739922032330924,
+                  "batch_L_hat": -53819.54429244027,
+                  "iterations": 200,
+                  "closed_form_norm": 11.198855632055148,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 8,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.765374592833876,
+                670.7972312703583,
+                319.178338762215,
+                175.80944625407167,
+                5.284201954397394,
+                3.529315960912052,
+                0.23558631921824105,
+                2.801302931596091
+              ],
+              "std": [
+                0.10640914097395322,
+                88.74773938757988,
+                43.28522029819288,
+                45.09349598139024,
+                1.7496657470258172,
+                1.1074020369785376,
+                0.13354316437372188,
+                1.527041250226624
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.420954397394137
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.66097587573532,
+              "test_mse": 8.095834412455511
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.7724003593187179,
+                  "relative_l2_distance": 0.6746845791646375,
+                  "train_mse": 17.622214586781688,
+                  "test_mse": 16.978125379983247,
+                  "batch_L_hat": -55195.78744154987,
+                  "iterations": 200,
+                  "closed_form_norm": 11.25852219116448,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 9,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7648045602605867,
+                670.9169381107491,
+                316.5447882736156,
+                177.1860749185668,
+                5.232899022801303,
+                3.511400651465798,
+                0.23224755700325733,
+                2.8159609120521174
+              ],
+              "std": [
+                0.10444772196728444,
+                86.76880869651191,
+                43.5392390756593,
+                44.981432623336865,
+                1.74991644274201,
+                1.12233774422713,
+                0.13251205077849962,
+                1.535785713382496
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.061459283387617
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.545796217596298,
+              "test_mse": 8.643210808561808
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.09766370616038049,
+                  "relative_l2_distance": 1.3433810284797234,
+                  "train_mse": 307.3210281849673,
+                  "test_mse": 317.77869197317574,
+                  "batch_L_hat": -54461.73636014279,
+                  "iterations": 200,
+                  "closed_form_norm": 11.07129994734909,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 10,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7630781758957654,
+                672.6726384364821,
+                317.9413680781759,
+                177.3656351791531,
+                5.221498371335505,
+                3.514657980456026,
+                0.2358306188925083,
+                2.8306188925081432
+              ],
+              "std": [
+                0.105270570015226,
+                87.96066451635738,
+                43.79212981757095,
+                45.047977769748634,
+                1.7497678866533892,
+                1.0973525129810187,
+                0.13425343324979197,
+                1.5527554392452172
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.084048859934853
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.335189428768789,
+              "test_mse": 9.423970919036227
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.05267936961451087,
+                  "relative_l2_distance": 1.376459683670749,
+                  "train_mse": 128.89477938293547,
+                  "test_mse": 152.4870104231033,
+                  "batch_L_hat": -54388.163064991124,
+                  "iterations": 200,
+                  "closed_form_norm": 11.24722650549891,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 11,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7635667752443006,
+                672.2337133550488,
+                317.9413680781759,
+                177.14617263843647,
+                5.238599348534202,
+                3.482084690553746,
+                0.2350162866449513,
+                2.824104234527687
+              ],
+              "std": [
+                0.10558113389344888,
+                88.12075953374321,
+                42.8898841791816,
+                44.87222528247078,
+                1.7499628639334475,
+                1.1237029668236882,
+                0.13309856403348036,
+                1.5551759001284573
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.23957003257329
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.516370745773285,
+              "test_mse": 8.624172408715687
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.2883404096148989,
+                  "relative_l2_distance": 1.1930294132041348,
+                  "train_mse": 16.022434827084513,
+                  "test_mse": 18.283576515444814,
+                  "batch_L_hat": -53275.64184763575,
+                  "iterations": 200,
+                  "closed_form_norm": 11.511674666580515,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 12,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7641368078175902,
+                671.8346905537459,
+                317.86156351791533,
+                176.9865635179153,
+                5.232899022801303,
+                3.517915309446254,
+                0.2334690553745925,
+                2.8436482084690553
+              ],
+              "std": [
+                0.10636496469039276,
+                88.36780434878654,
+                42.84315826282249,
+                45.18505113789193,
+                1.7499164427420102,
+                1.129485579194914,
+                0.132531791478603,
+                1.5676858128588114
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.14328338762215
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.532275215844775,
+              "test_mse": 8.600572620020545
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.5706892575094005,
+                  "relative_l2_distance": 0.9266183059821337,
+                  "train_mse": 10.220972115590817,
+                  "test_mse": 10.91907686695052,
+                  "batch_L_hat": -54387.30050988302,
+                  "iterations": 200,
+                  "closed_form_norm": 11.150296964012535,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 13,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.766319218241043,
+                669.799674267101,
+                317.4226384364821,
+                176.18851791530943,
+                5.267100977198697,
+                3.472312703583062,
+                0.23868078175895768,
+                2.8289902280130295
+              ],
+              "std": [
+                0.10534634543783983,
+                87.46594367424123,
+                42.80012015808835,
+                45.128830542955384,
+                1.7499164427420102,
+                1.1162329885050422,
+                0.13277194717406288,
+                1.5635526936957271
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.501605863192182
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.817020356003237,
+              "test_mse": 7.4483210709177206
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.5132346807114636,
+                  "relative_l2_distance": 0.9866765622923619,
+                  "train_mse": 12.115595224977177,
+                  "test_mse": 10.842231317623657,
+                  "batch_L_hat": -55716.58259728918,
+                  "iterations": 200,
+                  "closed_form_norm": 11.726478504578509,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 14,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7603257328990228,
+                674.5480456026058,
+                319.0586319218241,
+                177.74470684039088,
+                5.215798045602606,
+                3.5,
+                0.23648208469055376,
+                2.7866449511400653
+              ],
+              "std": [
+                0.10315807146875834,
+                86.48418575341464,
+                44.50075740033285,
+                44.792851033858256,
+                1.7496657470258172,
+                1.1092592240133197,
+                0.13325541407150204,
+                1.5319881743827048
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.281817589576548
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.56250330908114,
+              "test_mse": 8.54804709753699
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.7972320673386739,
+                  "relative_l2_distance": 0.6368169794553629,
+                  "train_mse": 19.096951692882364,
+                  "test_mse": 17.893775870250472,
+                  "batch_L_hat": -56491.561973200936,
+                  "iterations": 200,
+                  "closed_form_norm": 10.994517361609367,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 15,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7647231270358308,
+                671.435667752443,
+                318.18078175895766,
+                176.62744299674267,
+                5.244299674267101,
+                3.526058631921824,
+                0.23273615635179154,
+                2.811074918566775
+              ],
+              "std": [
+                0.10680664538179963,
+                88.72261892504606,
+                43.59316342914552,
+                45.27581893538254,
+                1.7499907160572366,
+                1.1350810083800589,
+                0.13220753634592758,
+                1.5536469078451847
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.22489576547231
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.218017861772639,
+              "test_mse": 9.885198646379225
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.5417695512458629,
+                  "relative_l2_distance": 0.9573196422868769,
+                  "train_mse": 10.501306706165046,
+                  "test_mse": 12.272041694833973,
+                  "batch_L_hat": -55802.67051479325,
+                  "iterations": 200,
+                  "closed_form_norm": 11.50148181317857,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 16,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7641042345276873,
+                671.435667752443,
+                319.7768729641694,
+                175.8293973941368,
+                5.289902280130293,
+                3.526058631921824,
+                0.23631921824104224,
+                2.824104234527687
+              ],
+              "std": [
+                0.10447056946503597,
+                87.22241412536718,
+                44.28772029268699,
+                44.9205268524175,
+                1.749545028869039,
+                1.1249922633749512,
+                0.13247261061161048,
+                1.5446678576438613
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.642377850162866
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.797096505701383,
+              "test_mse": 7.503383244900819
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.5827837328144073,
+                  "relative_l2_distance": 0.9134727879752004,
+                  "train_mse": 12.44582199350928,
+                  "test_mse": 10.596083381766743,
+                  "batch_L_hat": -55965.92675061899,
+                  "iterations": 200,
+                  "closed_form_norm": 11.487938905195584,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 17,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7642996742671011,
+                671.4755700325733,
+                317.5024429967427,
+                176.9865635179153,
+                5.25,
+                3.534201954397394,
+                0.23094462540716618,
+                2.801302931596091
+              ],
+              "std": [
+                0.1051294289924797,
+                87.65948827857366,
+                42.916103412850894,
+                44.777546007616394,
+                1.75,
+                1.1233252166119598,
+                0.1336474780886365,
+                1.5429565498571598
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.21271335504886
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.74317478215929,
+              "test_mse": 7.768107550479129
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.5816464084212839,
+                  "relative_l2_distance": 0.9147169962110863,
+                  "train_mse": 10.714063703883971,
+                  "test_mse": 8.447689426053133,
+                  "batch_L_hat": -55498.38224874677,
+                  "iterations": 200,
+                  "closed_form_norm": 11.253101011270827,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 18,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7669543973941378,
+                669.2809446254072,
+                317.821661237785,
+                175.72964169381106,
+                5.289902280130293,
+                3.526058631921824,
+                0.23648208469055387,
+                2.811074918566775
+              ],
+              "std": [
+                0.10567454125563071,
+                87.7646002688184,
+                42.693966685904215,
+                45.03597676084309,
+                1.7495450288690388,
+                1.1293270472383896,
+                0.13279629340547777,
+                1.5229432601184758
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.553680781758956
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.85904289137319,
+              "test_mse": 7.282539351701334
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.5902216296404629,
+                  "relative_l2_distance": 0.9052937317352164,
+                  "train_mse": 11.265087827138933,
+                  "test_mse": 9.580813670207313,
+                  "batch_L_hat": -55584.330015435575,
+                  "iterations": 200,
+                  "closed_form_norm": 11.054460138916046,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        },
+        {
+          "seed": 19,
+          "split": {
+            "n_train_total": 614,
+            "n_train_for_hyperparam": 553,
+            "n_val": 61,
+            "n_test": 154,
+            "train_ratio": 0.8,
+            "test_ratio": 0.19999999999999996,
+            "val_ratio_within_train": 0.1
+          },
+          "preprocessing": {
+            "feature_standardization": {
+              "fitted_on": "outer_train_split",
+              "mean": [
+                0.7649837133550493,
+                670.9568403908795,
+                318.93892508143324,
+                176.00895765472313,
+                5.267100977198697,
+                3.529315960912052,
+                0.2329804560260584,
+                2.8289902280130295
+              ],
+              "std": [
+                0.10561399384388996,
+                87.76710377656487,
+                44.38111263933272,
+                45.301144917489154,
+                1.7499164427420106,
+                1.1176495758670557,
+                0.13448324166617534,
+                1.5708272753217518
+              ]
+            },
+            "target_centering": {
+              "fitted_on": "outer_train_split",
+              "mean": 22.328560260586322
+            }
+          },
+          "selected_hyperparameters": {
+            "V": 0.0001,
+            "lambda_strength": 100.0,
+            "validation_mse": 10.96452399927251,
+            "prior_delta": 1e-08
+          },
+          "methods": {
+            "closed_form": {
+              "train_mse": 8.47995413937614,
+              "test_mse": 8.851527722202635
+            }
+          },
+          "grid_results": [
+            {
+              "config_id": "cfg_0001",
+              "config": {
+                "config_id": "cfg_0001",
+                "optimizer": "COBYLA",
+                "shots": 1024,
+                "maxiter": 200,
+                "reps": 6,
+                "su2_gates": [
+                  "rx",
+                  "y"
+                ],
+                "su2_gates_text": "rx,y",
+                "entanglement": "linear",
+                "loss": "neg_ratio"
+              },
+              "methods": {
+                "vqbr_cobyla": {
+                  "cosine_similarity": 0.36475030521904284,
+                  "relative_l2_distance": 1.1271643134707174,
+                  "train_mse": 12.08320143308498,
+                  "test_mse": 11.233462883397202,
+                  "batch_L_hat": -54457.16068236491,
+                  "iterations": 200,
+                  "closed_form_norm": 11.267374850742838,
+                  "optimizer": "COBYLA",
+                  "batch_mode": "full_data",
+                  "batch_size_used": 614,
+                  "shuffle_batches": false,
+                  "shots": 1024,
+                  "loss": "neg_ratio",
+                  "su2_gates": [
+                    "rx",
+                    "y"
+                  ],
+                  "entanglement": "linear",
+                  "reps": 6,
+                  "maxiter": 200,
+                  "config_id": "cfg_0001",
+                  "simulator_device": "CPU",
+                  "simulator_backend": "statevector_cpu",
+                  "simulator_reason": "Using CPU statevector simulator (qiskit-aer not installed; install qiskit-aer-gpu for GPU support).",
+                  "fit_vs_sim_state_l2": 0.0
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "closed_form_aggregate": {
+        "train_mse": {
+          "mean": 8.51480223113852,
+          "std": 0.2321971967238546
+        },
+        "test_mse": {
+          "mean": 8.684529084106787,
+          "std": 0.9414187971827345
+        }
+      },
+      "grid_aggregate": [
+        {
+          "config_id": "cfg_0001",
+          "config": {
+            "config_id": "cfg_0001",
+            "optimizer": "COBYLA",
+            "shots": 1024,
+            "maxiter": 200,
+            "reps": 6,
+            "su2_gates": [
+              "rx",
+              "y"
+            ],
+            "su2_gates_text": "rx,y",
+            "entanglement": "linear",
+            "loss": "neg_ratio"
+          },
+          "methods": {
+            "vqbr_cobyla": {
+              "cosine_similarity": {
+                "mean": 0.48007379132660705,
+                "std": 0.22294527606379688
+              },
+              "relative_l2_distance": {
+                "mean": 0.9930494219721927,
+                "std": 0.2317439597216723
+              },
+              "train_mse": {
+                "mean": 34.21526340946556,
+                "std": 67.54954820328656
+              },
+              "test_mse": {
+                "mean": 36.06841671524755,
+                "std": 71.41249808645335
+              },
+              "batch_L_hat": {
+                "mean": -55214.35257586852,
+                "std": 1077.1942213283678
+              },
+              "iterations": {
+                "mean": 200.0,
+                "std": 0.0
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "csv_outputs": {
+    "training_info_path": "/work/vantn/VQBR/results/energy/train_info_test.csv",
+    "summary_path": "/work/vantn/VQBR/results/energy/summary_test.csv"
+  }
+}

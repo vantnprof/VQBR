@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stderr, redirect_stdout
 import importlib
 import json
 import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 
@@ -24,7 +25,7 @@ from closed_form import ClosedFormMAPBayesianRegression  # noqa: E402
 
 
 EPS = 1e-12
-METHOD_KEYS = ("vqbr_cobyla", "vqbr_spsa")
+METHOD_KEYS = ("vqbr_cobyla",)
 METRIC_KEYS = (
     "cosine_similarity",
     "relative_l2_distance",
@@ -38,12 +39,6 @@ VQBR_OPTIMIZER_SETTINGS = (
         "optimizer": "COBYLA",
         "use_full_batch": True,
         "batch_mode": "full_data",
-    },
-    {
-        "method_key": "vqbr_spsa",
-        "optimizer": "SPSA",
-        "use_full_batch": False,
-        "batch_mode": "mini_batch",
     },
 )
 
@@ -208,6 +203,22 @@ def _parse_vqbr_optimizer_names(raw: str) -> List[str]:
     return unique_tokens
 
 
+class _TeeStream:
+    """Mirror writes to multiple stream-like objects."""
+
+    def __init__(self, *streams: Any):
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+
 def _select_vqbr_optimizer_settings(raw: str) -> List[Dict[str, Any]]:
     selected_optimizer_names = _parse_vqbr_optimizer_names(raw)
     settings_by_optimizer = {
@@ -286,7 +297,7 @@ def _resolve_pair_names(
             )
 
     # Fallback to folder discovery.
-    pair_names: List[str] = []
+    pair_names = []
     for p in sorted(dataset_root.glob("N*_D*")):
         if p.is_dir():
             _parse_pair_name(p.name)
@@ -517,84 +528,16 @@ def _evaluate_vqbr_metrics(
         "batch_L_hat": float(final_batch_L_hat),
         "iterations": int(len(batch_loss_history)),
         "batch_loss_history": [float(x) for x in batch_loss_history],
-        # Kept for backward compatibility with older plotting helpers.
         "loss_history": [float(x) for x in batch_loss_history],
         "closed_form_norm": w_star_norm,
         "encoding_vector": [float(x) for x in np.asarray(encoding_vector, dtype=float)],
-        "reconstructed_vector": [
-            float(x) for x in np.asarray(reconstructed_vector, dtype=float)
-        ],
+        "reconstructed_vector": [float(x) for x in np.asarray(reconstructed_vector, dtype=float)],
     }
 
 
-def _select_hyperparameters(
-    prior_case: str,
-    pair_name: str,
-    seed: int,
-    X_train_for_tuning: np.ndarray,
-    y_train_for_tuning_centered: np.ndarray,
-    y_train_for_tuning_mean: float,
-    X_train_for_prior_variance: np.ndarray,
-    X_val: np.ndarray,
-    y_val_raw: np.ndarray,
-    V_grid: np.ndarray,
-    lambda_grid: np.ndarray,
-    prior_delta: float,
-    log_realtime: bool,
-    log_hyperparam_sweep: bool,
-) -> Dict[str, float]:
-    best: Dict[str, float] = {
-        "validation_mse": float("inf"),
-        "V": float(V_grid[0]),
-        "lambda_strength": float(lambda_grid[0]),
-    }
-
-    model = ClosedFormMAPBayesianRegression()
-    for V in V_grid:
-        for lambda_strength in lambda_grid:
-            m0, sigma_diag = _build_prior(
-                prior_case=prior_case,
-                X_reference=X_train_for_tuning,
-                lambda_strength=float(lambda_strength),
-                delta=prior_delta,
-                variance_reference=X_train_for_prior_variance,
-            )
-            model.fit(
-                X_train_for_tuning,
-                y_train_for_tuning_centered,
-                m0,
-                sigma_diag,
-                float(V),
-            )
-            y_val_pred_centered = model.predict(X_val)
-            y_val_pred = y_val_pred_centered + float(y_train_for_tuning_mean)
-            val_mse = _mse(y_val_raw, y_val_pred)
-            if log_hyperparam_sweep:
-                print(
-                    "    "
-                    f"[{pair_name}][{prior_case}][seed={seed}] sweep: "
-                    f"V={float(V):.3e}, lambda={float(lambda_strength):.3e}, "
-                    f"val_mse={val_mse:.6f}",
-                    flush=True,
-                )
-            if val_mse < best["validation_mse"]:
-                best = {
-                    "validation_mse": float(val_mse),
-                    "V": float(V),
-                    "lambda_strength": float(lambda_strength),
-                }
-    if log_realtime:
-        print(
-            "    "
-            f"[{pair_name}][{prior_case}][seed={seed}] selected hyperparams: "
-            f"V={best['V']:.3e}, lambda={best['lambda_strength']:.3e}, "
-            f"val_mse={best['validation_mse']:.6f}",
-            flush=True,
-        )
-    return best
-
-
-def _aggregate_case_results(case_seed_results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, float]]]:
+def _aggregate_case_results(
+    case_seed_results: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Dict[str, float]]]:
     aggregate: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     methods_present = set()
@@ -612,10 +555,7 @@ def _aggregate_case_results(case_seed_results: List[Dict[str, Any]]) -> Dict[str
             if not values:
                 continue
             arr = np.asarray(values, dtype=float)
-            aggregate[method][metric] = {
-                "mean": float(np.mean(arr)),
-                "std": float(np.std(arr, ddof=0)),
-            }
+            aggregate[method][metric] = {"mean": float(np.mean(arr)), "std": float(np.std(arr, ddof=0))}
     return aggregate
 
 
@@ -641,17 +581,11 @@ def _aggregate_overall(pair_results: Dict[str, Any]) -> Dict[str, Dict[str, Dict
             if not values:
                 continue
             arr = np.asarray(values, dtype=float)
-            overall[method][metric] = {
-                "mean": float(np.mean(arr)),
-                "std": float(np.std(arr, ddof=0)),
-            }
+            overall[method][metric] = {"mean": float(np.mean(arr)), "std": float(np.std(arr, ddof=0))}
     return overall
 
 
-def _resolve_vqbr_optimizer_configs(
-    args: argparse.Namespace,
-    n_train_samples: int,
-) -> List[Dict[str, Any]]:
+def _resolve_vqbr_optimizer_configs(args: argparse.Namespace, n_train_samples: int) -> List[Dict[str, Any]]:
     if n_train_samples <= 0:
         raise ValueError("n_train_samples must be positive.")
     if args.vqbr_batch_size <= 0:
@@ -680,6 +614,122 @@ def _resolve_vqbr_optimizer_configs(
     return configs
 
 
+# ----------------------------
+# Fix A: global (V, lambda) per (pair, prior), estimated on pilot seeds
+# ----------------------------
+def _select_global_hyperparameters_for_pair(
+    *,
+    dataset_root: Path,
+    pair_name: str,
+    prior_case: str,
+    pilot_seeds: Sequence[int],
+    use_padded_features: bool,
+    V_grid: np.ndarray,
+    lambda_grid: np.ndarray,
+    prior_delta: float,
+    val_ratio_within_train: float,
+    log_realtime: bool,
+    log_hyperparam_sweep: bool,
+) -> Dict[str, float]:
+    # Accumulate validation MSEs across pilot seeds for each (V, lambda)
+    # key: (iV, iL) -> list of mses
+    store: Dict[Tuple[int, int], List[float]] = {}
+
+    model = ClosedFormMAPBayesianRegression()
+    for seed in pilot_seeds:
+        split = _load_pair_seed_split(
+            dataset_root=dataset_root,
+            pair_name=pair_name,
+            seed=int(seed),
+            use_padded_features=bool(use_padded_features),
+        )
+        X_train_raw = np.asarray(split["X_train"], dtype=float)
+        y_train_raw = np.asarray(split["y_train"], dtype=float).reshape(-1)
+
+        inner = _make_inner_split(
+            n_train_total=int(X_train_raw.shape[0]),
+            val_ratio_within_train=float(val_ratio_within_train),
+            seed=int(seed),
+        )
+        X_tune_train_raw = X_train_raw[inner.train_tune_indices]
+        y_tune_train_raw = y_train_raw[inner.train_tune_indices]
+        X_val_raw = X_train_raw[inner.val_indices]
+        y_val_raw = y_train_raw[inner.val_indices]
+
+        tune_mean, tune_std = _fit_feature_standardizer(X_tune_train_raw)
+        X_tune_train = _apply_feature_standardizer(X_tune_train_raw, tune_mean, tune_std)
+        X_val = _apply_feature_standardizer(X_val_raw, tune_mean, tune_std)
+        y_tune_mean, y_tune_train_centered = _fit_and_center_target(y_tune_train_raw)
+
+        for iV, V in enumerate(V_grid):
+            for iL, lambda_strength in enumerate(lambda_grid):
+                m0, sigma_diag = _build_prior(
+                    prior_case=prior_case,
+                    X_reference=X_tune_train,
+                    lambda_strength=float(lambda_strength),
+                    delta=float(prior_delta),
+                    variance_reference=X_tune_train_raw,
+                )
+                model.fit(
+                    X_tune_train,
+                    y_tune_train_centered,
+                    m0,
+                    sigma_diag,
+                    float(V),
+                )
+                y_val_pred_centered = model.predict(X_val)
+                y_val_pred = y_val_pred_centered + float(y_tune_mean)
+                val_mse = _mse(y_val_raw, y_val_pred)
+
+                store.setdefault((iV, iL), []).append(float(val_mse))
+
+                if log_hyperparam_sweep:
+                    print(
+                        "    "
+                        f"[{pair_name}][{prior_case}][pilot_seed={seed}] sweep: "
+                        f"V={float(V):.3e}, lambda={float(lambda_strength):.3e}, "
+                        f"val_mse={val_mse:.6f}",
+                        flush=True,
+                    )
+
+    best = {
+        "validation_mse_mean": float("inf"),
+        "validation_mse_std": float("nan"),
+        "V": float(V_grid[0]),
+        "lambda_strength": float(lambda_grid[0]),
+        "num_pilot_seeds": int(len(pilot_seeds)),
+        "pilot_seeds": [int(s) for s in pilot_seeds],
+    }
+
+    for (iV, iL), vals in store.items():
+        if not vals:
+            continue
+        arr = np.asarray(vals, dtype=float)
+        mean = float(np.mean(arr))
+        std = float(np.std(arr, ddof=0))
+        if mean < best["validation_mse_mean"]:
+            best = {
+                "validation_mse_mean": mean,
+                "validation_mse_std": std,
+                "V": float(V_grid[iV]),
+                "lambda_strength": float(lambda_grid[iL]),
+                "num_pilot_seeds": int(len(pilot_seeds)),
+                "pilot_seeds": [int(s) for s in pilot_seeds],
+            }
+
+    if log_realtime:
+        print(
+            "  "
+            f"[{pair_name}][{prior_case}] GLOBAL hyperparams selected (Fix A): "
+            f"V={best['V']:.3e}, lambda={best['lambda_strength']:.3e}, "
+            f"pilot_val_mse_mean={best['validation_mse_mean']:.6f}, "
+            f"pilot_val_mse_std={best['validation_mse_std']:.6f}, "
+            f"pilot_seeds={best['pilot_seeds']}",
+            flush=True,
+        )
+    return best
+
+
 def _run_one_seed_one_prior(
     *,
     pair_name: str,
@@ -689,45 +739,12 @@ def _run_one_seed_one_prior(
     y_train_raw: np.ndarray,
     X_test_raw: np.ndarray,
     y_test_raw: np.ndarray,
-    V_grid: np.ndarray,
-    lambda_grid: np.ndarray,
+    fixed_V: float,
+    fixed_lambda_strength: float,
     args: argparse.Namespace,
     split_meta: Dict[str, Any],
+    global_hyperparam_summary: Dict[str, Any],
 ) -> Dict[str, Any]:
-    inner = _make_inner_split(
-        n_train_total=int(X_train_raw.shape[0]),
-        val_ratio_within_train=float(args.val_ratio_within_train),
-        seed=seed,
-    )
-
-    X_tune_train_raw = X_train_raw[inner.train_tune_indices]
-    y_tune_train_raw = y_train_raw[inner.train_tune_indices]
-    X_val_raw = X_train_raw[inner.val_indices]
-    y_val_raw = y_train_raw[inner.val_indices]
-
-    # Inner split preprocessing for hyperparameter selection (training data only).
-    tune_mean, tune_std = _fit_feature_standardizer(X_tune_train_raw)
-    X_tune_train = _apply_feature_standardizer(X_tune_train_raw, tune_mean, tune_std)
-    X_val = _apply_feature_standardizer(X_val_raw, tune_mean, tune_std)
-    y_tune_mean, y_tune_train_centered = _fit_and_center_target(y_tune_train_raw)
-
-    selected = _select_hyperparameters(
-        prior_case=prior_case,
-        pair_name=pair_name,
-        seed=seed,
-        X_train_for_tuning=X_tune_train,
-        y_train_for_tuning_centered=y_tune_train_centered,
-        y_train_for_tuning_mean=y_tune_mean,
-        X_train_for_prior_variance=X_tune_train_raw,
-        X_val=X_val,
-        y_val_raw=y_val_raw,
-        V_grid=V_grid,
-        lambda_grid=lambda_grid,
-        prior_delta=args.prior_delta,
-        log_realtime=args.log_realtime,
-        log_hyperparam_sweep=args.log_hyperparam_sweep,
-    )
-
     # Final train/test preprocessing with scaler fitted only on the outer train split.
     train_mean, train_std = _fit_feature_standardizer(X_train_raw)
     X_train = _apply_feature_standardizer(X_train_raw, train_mean, train_std)
@@ -737,11 +754,11 @@ def _run_one_seed_one_prior(
     m0_train, sigma_diag_train = _build_prior(
         prior_case=prior_case,
         X_reference=X_train,
-        lambda_strength=selected["lambda_strength"],
+        lambda_strength=float(fixed_lambda_strength),
         delta=args.prior_delta,
         variance_reference=X_train_raw,
     )
-    V_selected = float(selected["V"])
+    V_selected = float(fixed_V)
 
     # Closed-form MAP reference solution.
     closed_form = ClosedFormMAPBayesianRegression()
@@ -765,14 +782,10 @@ def _run_one_seed_one_prior(
         )
 
     vqbr_module = importlib.import_module("vqbr")
-    VariationalQuantumBayesianRegression = getattr(
-        vqbr_module, "VariationalQuantumBayesianRegression"
-    )
-    optimizer_configs = _resolve_vqbr_optimizer_configs(
-        args=args,
-        n_train_samples=int(X_train.shape[0]),
-    )
+    VariationalQuantumBayesianRegression = getattr(vqbr_module, "VariationalQuantumBayesianRegression")
+    optimizer_configs = _resolve_vqbr_optimizer_configs(args=args, n_train_samples=int(X_train.shape[0]))
     vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
+
     for opt_cfg in optimizer_configs:
         method_key = str(opt_cfg["method_key"])
         optimizer_name = str(opt_cfg["optimizer"])
@@ -816,6 +829,7 @@ def _run_one_seed_one_prior(
                 batch_size=batch_size_used,
                 log_every_iter=args.log_every_iter,
             )
+
         fitted_state = vqbr.fit(
             X_train,
             y_train_centered,
@@ -824,16 +838,14 @@ def _run_one_seed_one_prior(
             V_selected,
             iteration_callback=iteration_callback,
         )
+
         statevector = np.asarray(fitted_state, dtype=complex).reshape(-1)
         state_norm = float(np.linalg.norm(statevector))
         if state_norm <= EPS:
             raise RuntimeError("VQBR fit returned a zero-norm state vector.")
         statevector = statevector / state_norm
 
-        reconstructed_vector, encoding_vector = _reconstruct_vqbr_vector_from_state(
-            statevector,
-            w_star=w_star,
-        )
+        reconstructed_vector, encoding_vector = _reconstruct_vqbr_vector_from_state(statevector, w_star=w_star)
         batch_loss_history = _collect_batch_loss_history(vqbr.history_)
         finite_batch_losses = [x for x in batch_loss_history if np.isfinite(x)]
         final_batch_L_hat = finite_batch_losses[-1] if finite_batch_losses else float("nan")
@@ -881,8 +893,6 @@ def _run_one_seed_one_prior(
         "seed": int(seed),
         "split": {
             "n_train_total": n_train,
-            "n_train_for_hyperparam": int(X_tune_train.shape[0]),
-            "n_val": int(X_val.shape[0]),
             "n_test": n_test,
             "train_ratio": float(train_ratio),
             "test_ratio": float(test_ratio),
@@ -900,10 +910,12 @@ def _run_one_seed_one_prior(
             },
         },
         "selected_hyperparameters": {
-            "V": float(selected["V"]),
-            "lambda_strength": float(selected["lambda_strength"]),
-            "validation_mse": float(selected["validation_mse"]),
+            # Fix A: report the frozen hyperparams and how they were chosen.
+            "selection_mode": "global_frozen_per_pair",
+            "V": float(V_selected),
+            "lambda_strength": float(fixed_lambda_strength),
             "prior_delta": float(args.prior_delta),
+            "pilot_selection": dict(global_hyperparam_summary),
         },
         "methods": methods,
     }
@@ -929,6 +941,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         seed_offset=args.seed_offset,
         manifest_seeds=[int(x) for x in manifest_seeds],
     )
+
     V_grid = _parse_float_grid(args.V_grid)
     lambda_grid = _parse_float_grid(args.lambda_grid)
     vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
@@ -936,19 +949,17 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     selected_method_keys = [str(setting["method_key"]) for setting in selected_optimizer_settings]
     reported_method_keys = ["closed_form"] + selected_method_keys
 
+    pilot_k = int(args.hyperparam_pilot_seeds)
+    if pilot_k <= 0:
+        raise ValueError("--hyperparam-pilot-seeds must be positive.")
+    pilot_seeds = list(seeds[: min(pilot_k, len(seeds))])
+
     result: Dict[str, Any] = {
         "dataset": {
             "root": str(dataset_root),
             "source": "synthetic",
             "pair_names": pair_names,
             "num_pairs": int(len(pair_names)),
-            "manifest": {
-                "dimensions": manifest.get("dimensions", []),
-                "sample_multipliers": manifest.get("sample_multipliers", []),
-                "noise_std": manifest.get("noise_std"),
-                "train_ratio": manifest.get("train_ratio"),
-                "test_ratio": manifest.get("test_ratio"),
-            },
         },
         "config": {
             "num_seeds": int(len(seeds)),
@@ -969,44 +980,27 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
                 "learning_rate": float(args.vqbr_learning_rate),
                 "loss": str(vqbr_loss),
                 "use_shot_noise": bool(args.vqbr_use_shot_noise),
-                "optimizers": [
-                    {
-                        "method_key": str(setting["method_key"]),
-                        "optimizer": str(setting["optimizer"]).upper(),
-                        "batch_mode": str(setting["batch_mode"]),
-                        "batch_size": (
-                            "n_train_total"
-                            if bool(setting["use_full_batch"])
-                            else int(args.vqbr_batch_size)
-                        ),
-                        "shuffle_batches": (
-                            False
-                            if bool(setting["use_full_batch"])
-                            else bool(args.vqbr_shuffle_batches)
-                        ),
-                    }
-                    for setting in selected_optimizer_settings
-                ],
+            },
+            "hyperparam_selection": {
+                "mode": "FixA_global_frozen_per_pair",
+                "pilot_seeds": [int(s) for s in pilot_seeds],
+                "pilot_seeds_count": int(len(pilot_seeds)),
             },
             "logging": {
                 "realtime": bool(args.log_realtime),
                 "log_every_iter": int(args.log_every_iter),
                 "log_hyperparam_sweep": bool(args.log_hyperparam_sweep),
             },
-            "preprocessing": {
-                "feature_standardization": True,
-                "target_centering": True,
-                "standardization_scope": "fit on training split only, then applied to validation/test",
-            },
         },
         "pair_results": {},
         "overall_aggregate": {},
     }
 
-    print("=== Synthetic Experiment ===")
+    print("=== Synthetic Experiment (Fix A: global frozen hyperparams per pair) ===")
     print(f"Dataset root: {dataset_root}")
     print(f"Pairs ({len(pair_names)}): {pair_names}")
     print(f"Seeds ({len(seeds)}): {seeds}")
+    print(f"Pilot seeds for global (V,lambda): {pilot_seeds}")
     print(f"Use padded features: {bool(args.use_padded_features)}")
     print(f"Inner validation ratio (within train): {args.val_ratio_within_train:.2f}")
     print("VQBR config:")
@@ -1016,34 +1010,6 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         f"batch_size={int(args.vqbr_batch_size)}, "
         f"reps={int(args.vqbr_reps)}, "
         f"maxiter={int(args.vqbr_maxiter)}"
-    )
-    print("  optimizer runs:")
-    for setting in selected_optimizer_settings:
-        method_key = str(setting["method_key"])
-        optimizer = str(setting["optimizer"]).upper()
-        batch_mode = str(setting["batch_mode"])
-        if bool(setting["use_full_batch"]):
-            batch_size_desc = "n_train_total"
-            shuffle_batches = False
-        else:
-            batch_size_desc = f"min({int(args.vqbr_batch_size)}, n_train_total)"
-            shuffle_batches = bool(args.vqbr_shuffle_batches)
-        print(
-            "    "
-            f"{method_key}: optimizer={optimizer}, mode={batch_mode}, "
-            f"batch_size={batch_size_desc}, shuffle_batches={shuffle_batches}"
-        )
-    print(
-        "  "
-        f"shuffle_batches={bool(args.vqbr_shuffle_batches)}, "
-        f"learning_rate={float(args.vqbr_learning_rate):.6g}, "
-        f"loss={vqbr_loss}"
-    )
-    print(
-        "  "
-        f"use_shot_noise={bool(args.vqbr_use_shot_noise)}, "
-        f"verbose={bool(args.vqbr_verbose)}, "
-        f"log_every_iter={int(args.log_every_iter)}"
     )
     print("")
 
@@ -1055,15 +1021,29 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             f"d={pair_meta.get('d')}, padded_dim={pair_meta.get('padded_dim')}"
         )
 
-        pair_block: Dict[str, Any] = {
-            "pair": pair_meta,
-            "prior_cases": {},
-        }
+        pair_block: Dict[str, Any] = {"pair": pair_meta, "prior_cases": {}}
 
         for prior_case in PRIOR_CASES:
             print(f"  [Prior case: {prior_case}]")
-            case_seed_results: List[Dict[str, Any]] = []
 
+            # Fix A: select once, reuse for all seeds for this (pair, prior)
+            global_hp = _select_global_hyperparameters_for_pair(
+                dataset_root=dataset_root,
+                pair_name=pair_name,
+                prior_case=prior_case,
+                pilot_seeds=pilot_seeds,
+                use_padded_features=bool(args.use_padded_features),
+                V_grid=V_grid,
+                lambda_grid=lambda_grid,
+                prior_delta=float(args.prior_delta),
+                val_ratio_within_train=float(args.val_ratio_within_train),
+                log_realtime=bool(args.log_realtime),
+                log_hyperparam_sweep=bool(args.log_hyperparam_sweep),
+            )
+            fixed_V = float(global_hp["V"])
+            fixed_lambda = float(global_hp["lambda_strength"])
+
+            case_seed_results: List[Dict[str, Any]] = []
             for i, seed in enumerate(seeds, start=1):
                 print(f"    Seed {seed} ({i}/{len(seeds)})", flush=True)
                 split = _load_pair_seed_split(
@@ -1081,20 +1061,19 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
                     y_train_raw=np.asarray(split["y_train"], dtype=float).reshape(-1),
                     X_test_raw=np.asarray(split["X_test"], dtype=float),
                     y_test_raw=np.asarray(split["y_test"], dtype=float).reshape(-1),
-                    V_grid=V_grid,
-                    lambda_grid=lambda_grid,
+                    fixed_V=fixed_V,
+                    fixed_lambda_strength=fixed_lambda,
                     args=args,
                     split_meta=dict(split.get("split_meta", {})),
+                    global_hyperparam_summary=global_hp,
                 )
-                # Keep only compact metadata useful for traceability.
-                seed_result["data_files"] = {
-                    "seed_dir": str(split["seed_dir"]),
-                }
+                seed_result["data_files"] = {"seed_dir": str(split["seed_dir"])}
                 case_seed_results.append(seed_result)
 
             pair_block["prior_cases"][prior_case] = {
                 "per_seed": case_seed_results,
                 "aggregate": _aggregate_case_results(case_seed_results),
+                "global_hyperparameters": dict(global_hp),
             }
             print("")
 
@@ -1114,7 +1093,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run closed-form and VQBR on generated synthetic datasets over (N, D) pairs "
-            "with per-seed train/test splits."
+            "with per-seed train/test splits. Fix A: globally freeze (V,lambda) per pair."
         )
     )
     parser.add_argument(
@@ -1129,78 +1108,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional comma-separated subset of pair names (e.g., N16_D8,N80_D16).",
     )
-    parser.add_argument(
-        "--use-padded-features",
-        action="store_true",
-        help="Use X_padded from train/test files when present.",
-    )
-    parser.add_argument(
-        "--use-raw-features",
-        dest="use_padded_features",
-        action="store_false",
-        help="Use raw X from train/test files instead of X_padded.",
-    )
+    parser.add_argument("--use-padded-features", action="store_true")
+    parser.add_argument("--use-raw-features", dest="use_padded_features", action="store_false")
     parser.set_defaults(use_padded_features=True)
 
     parser.add_argument("--val-ratio-within-train", type=float, default=0.1)
-    parser.add_argument(
-        "--num-seeds",
-        type=int,
-        default=None,
-        help=(
-            "Number of seeds to use starting from --seed-offset. "
-            "If omitted, all seeds in manifest.json are used."
-        ),
-    )
+    parser.add_argument("--num-seeds", type=int, default=None)
     parser.add_argument("--seed-offset", type=int, default=0)
-    parser.add_argument(
-        "--seeds",
-        type=str,
-        default=None,
-        help="Comma-separated explicit seed list. If provided, overrides --num-seeds/--seed-offset.",
-    )
+    parser.add_argument("--seeds", type=str, default=None)
 
-    parser.add_argument(
-        "--V-grid",
-        type=str,
-        default="1e-4,1e-3,1e-2,1e-1,1,10",
-    )
-    parser.add_argument(
-        "--lambda-grid",
-        type=str,
-        default="1e-4,1e-3,1e-2,1e-1,1,10,100",
-    )
+    parser.add_argument("--V-grid", type=str, default="1e-4,1e-3,1e-2,1e-1,1,10")
+    parser.add_argument("--lambda-grid", type=str, default="1e-4,1e-3,1e-2,1e-1,1,10,100")
     parser.add_argument("--prior-delta", type=float, default=1e-8)
 
-    parser.add_argument("--vqbr-shots", type=int, default=4096)
+    # Fix A: how many seeds to use for pilot hyperparam selection
+    parser.add_argument(
+        "--hyperparam-pilot-seeds",
+        type=int,
+        default=3,
+        help="Number of earliest seeds used to pick a global (V,lambda) per pair (Fix A).",
+    )
+
+    parser.add_argument("--vqbr-shots", type=int, default=1024)
     parser.add_argument("--vqbr-batch-size", type=int, default=100)
-    parser.add_argument("--vqbr-reps", type=int, default=2)
+    parser.add_argument("--vqbr-reps", type=int, default=4)
     parser.add_argument(
         "--vqbr-optimizer",
         "--vqbr-optimizers",
         dest="vqbr_optimizer",
         type=str,
-        default="COBYLA,SPSA",
-        help=(
-            "Comma-separated VQBR optimizers to run. "
-            "Supported values: COBYLA,SPSA (case-insensitive)."
-        ),
+        default="COBYLA",
+        help="Comma-separated VQBR optimizers to run. Supported: COBYLA.",
     )
-    parser.add_argument("--vqbr-maxiter", type=int, default=200)
+    parser.add_argument("--vqbr-maxiter", type=int, default=400)
     parser.add_argument("--vqbr-shuffle-batches", action="store_true")
     parser.add_argument("--no-vqbr-shuffle-batches", dest="vqbr_shuffle_batches", action="store_false")
     parser.set_defaults(vqbr_shuffle_batches=True)
     parser.add_argument("--vqbr-learning-rate", type=float, default=0.05)
-    parser.add_argument(
-        "--vqbr-loss",
-        type=str,
-        default="log_ratio",
-        help=(
-            "VQBR objective form. "
-            "Supported values: log_ratio, neg_ratio "
-            "(aliases: log, ratio, raw_ratio)."
-        ),
-    )
+    parser.add_argument("--vqbr-loss", type=str, default="neg_ratio")
     parser.add_argument("--vqbr-use-shot-noise", action="store_true")
     parser.add_argument("--no-vqbr-shot-noise", dest="vqbr_use_shot_noise", action="store_false")
     parser.set_defaults(vqbr_use_shot_noise=True)
@@ -1209,22 +1154,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-realtime", action="store_true")
     parser.add_argument("--no-log-realtime", dest="log_realtime", action="store_false")
     parser.set_defaults(log_realtime=True)
-    parser.add_argument(
-        "--log-every-iter",
-        type=int,
-        default=5,
-        help="Log VQBR progress every K iterations when realtime logging is enabled.",
-    )
-    parser.add_argument(
-        "--log-hyperparam-sweep",
-        action="store_true",
-        help="Print every (V, lambda) validation MSE during inner hyperparameter search.",
-    )
+    parser.add_argument("--log-every-iter", type=int, default=5)
+    parser.add_argument("--log-hyperparam-sweep", action="store_true")
 
     parser.add_argument(
         "--output-path",
         type=str,
-        default=str(ROOT_DIR / "results" / "synthetic" / "synthetic_experiemnt_results.json"),
+        default=str(ROOT_DIR / "results" / "synthetic" / "synthetic_experiment_results.json"),
+    )
+    parser.add_argument(
+        "--console-log-path",
+        type=str,
+        default=str(ROOT_DIR / "results" / "synthetic" / "synthetic_experiment_run.log"),
+        help="Path to mirror all console output. Set empty string to disable file logging.",
     )
     parser.add_argument("--json-indent", type=int, default=2)
     return parser
@@ -1233,7 +1175,19 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    run_experiment(args)
+    console_log_raw = str(args.console_log_path).strip()
+    if not console_log_raw:
+        run_experiment(args)
+        return
+
+    console_log_path = Path(console_log_raw).expanduser().resolve()
+    console_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with console_log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+        tee_stdout = _TeeStream(sys.__stdout__, log_file)
+        tee_stderr = _TeeStream(sys.__stderr__, log_file)
+        with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
+            print(f"Console log file: {console_log_path}")
+            run_experiment(args)
 
 
 if __name__ == "__main__":

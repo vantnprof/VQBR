@@ -26,7 +26,6 @@ for module_dir in ("closed_form", "vqbr"):
 
 from closed_form import ClosedFormMAPBayesianRegression  # noqa: E402
 
-
 EPS = 1e-12
 METHOD_KEYS = ("vqbr_cobyla", "vqbr_spsa")
 METRIC_KEYS = (
@@ -745,6 +744,56 @@ def _select_hyperparameters(
     return best
 
 
+# ============================
+# Fix A: Global (V, lambda)
+# ============================
+def _select_global_hyperparameters(
+    *,
+    prior_case: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    V_grid: np.ndarray,
+    lambda_grid: np.ndarray,
+    args: argparse.Namespace,
+    ref_seed: int,
+) -> Dict[str, float]:
+    # Use one fixed reference split (ref_seed) to choose (V, lambda) once,
+    # then reuse it for all seeds to stabilize evaluation.
+    splits = _make_splits(
+        n_samples=int(X.shape[0]),
+        train_ratio=float(args.train_ratio),
+        val_ratio_within_train=float(args.val_ratio_within_train),
+        seed=int(ref_seed),
+    )
+
+    X_tune_train_raw = X[splits.train_val_indices]
+    y_tune_train_raw = y[splits.train_val_indices]
+    X_val_raw = X[splits.val_indices]
+    y_val_raw = y[splits.val_indices]
+
+    tune_mean, tune_std = _fit_feature_standardizer(X_tune_train_raw)
+    X_tune_train = _apply_feature_standardizer(X_tune_train_raw, tune_mean, tune_std)
+    X_val = _apply_feature_standardizer(X_val_raw, tune_mean, tune_std)
+    y_tune_mean, y_tune_train_centered = _fit_and_center_target(y_tune_train_raw)
+
+    selected = _select_hyperparameters(
+        prior_case=prior_case,
+        seed=int(ref_seed),
+        X_train_for_tuning=X_tune_train,
+        y_train_for_tuning_centered=y_tune_train_centered,
+        y_train_for_tuning_mean=float(y_tune_mean),
+        X_train_for_prior_variance=X_tune_train_raw,
+        X_val=X_val,
+        y_val_raw=y_val_raw,
+        V_grid=V_grid,
+        lambda_grid=lambda_grid,
+        prior_delta=float(args.prior_delta),
+        log_realtime=True,
+        log_hyperparam_sweep=bool(args.log_hyperparam_sweep),
+    )
+    return selected
+
+
 def _aggregate_case_results(case_seed_results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Dict[str, float]]]:
     aggregate: Dict[str, Dict[str, Dict[str, float]]] = {}
 
@@ -802,7 +851,7 @@ def _resolve_vqbr_optimizer_configs(
     return configs
 
 
-def _run_one_seed_one_prior(
+def _prepare_seed_run(
     *,
     seed: int,
     prior_case: str,
@@ -812,7 +861,8 @@ def _run_one_seed_one_prior(
     V_grid: np.ndarray,
     lambda_grid: np.ndarray,
     args: argparse.Namespace,
-) -> Dict[str, Any]:
+    frozen_hyperparams: Dict[str, float] | None = None,
+) -> PreparedSeedRun:
     X_train_raw = X[splits.train_indices]
     y_train_raw = y[splits.train_indices]
     X_test_raw = X[splits.test_indices]
@@ -829,256 +879,34 @@ def _run_one_seed_one_prior(
     X_val = _apply_feature_standardizer(X_val_raw, tune_mean, tune_std)
     y_tune_mean, y_tune_train_centered = _fit_and_center_target(y_tune_train_raw)
 
-    selected = _select_hyperparameters(
-        prior_case=prior_case,
-        seed=seed,
-        X_train_for_tuning=X_tune_train,
-        y_train_for_tuning_centered=y_tune_train_centered,
-        y_train_for_tuning_mean=y_tune_mean,
-        X_train_for_prior_variance=X_tune_train_raw,
-        X_val=X_val,
-        y_val_raw=y_val_raw,
-        V_grid=V_grid,
-        lambda_grid=lambda_grid,
-        prior_delta=args.prior_delta,
-        log_realtime=args.log_realtime,
-        log_hyperparam_sweep=args.log_hyperparam_sweep,
-    )
+    # Fix A: optionally bypass per-seed selection and reuse global frozen (V, lambda).
+    if frozen_hyperparams is not None:
+        selected = dict(frozen_hyperparams)
+        if args.log_realtime:
+            print(
+                "    "
+                f"[{prior_case}][seed={seed}] using frozen hyperparams: "
+                f"V={selected['V']:.3e}, lambda={selected['lambda_strength']:.3e}",
+                flush=True,
+            )
+    else:
+        selected = _select_hyperparameters(
+            prior_case=prior_case,
+            seed=seed,
+            X_train_for_tuning=X_tune_train,
+            y_train_for_tuning_centered=y_tune_train_centered,
+            y_train_for_tuning_mean=y_tune_mean,
+            X_train_for_prior_variance=X_tune_train_raw,
+            X_val=X_val,
+            y_val_raw=y_val_raw,
+            V_grid=V_grid,
+            lambda_grid=lambda_grid,
+            prior_delta=args.prior_delta,
+            log_realtime=args.log_realtime,
+            log_hyperparam_sweep=args.log_hyperparam_sweep,
+        )
 
     # Final train/test preprocessing with scaler fitted only on the outer train split.
-    train_mean, train_std = _fit_feature_standardizer(X_train_raw)
-    X_train = _apply_feature_standardizer(X_train_raw, train_mean, train_std)
-    X_test = _apply_feature_standardizer(X_test_raw, train_mean, train_std)
-    y_train_mean, y_train_centered = _fit_and_center_target(y_train_raw)
-
-    m0_train, sigma_diag_train = _build_prior(
-        prior_case=prior_case,
-        X_reference=X_train,
-        lambda_strength=selected["lambda_strength"],
-        delta=args.prior_delta,
-        variance_reference=X_train_raw,
-    )
-    V_selected = float(selected["V"])
-
-    # Closed-form MAP reference solution.
-    closed_form = ClosedFormMAPBayesianRegression()
-    closed_form.fit(X_train, y_train_centered, m0_train, sigma_diag_train, V_selected)
-    w_star = closed_form.get_weights()
-
-    methods: Dict[str, Dict[str, Any]] = {}
-    y_train_pred_closed_form = np.asarray(closed_form.predict(X_train), dtype=float) + float(y_train_mean)
-    y_test_pred_closed_form = np.asarray(closed_form.predict(X_test), dtype=float) + float(y_train_mean)
-    methods["closed_form"] = {
-        "train_mse": _mse(y_train_raw, y_train_pred_closed_form),
-        "test_mse": _mse(y_test_raw, y_test_pred_closed_form),
-    }
-    if args.log_realtime:
-        print(
-            "    "
-            f"[{prior_case}][seed={seed}][closed_form] "
-            f"train_mse={methods['closed_form']['train_mse']:.6f}, "
-            f"test_mse={methods['closed_form']['test_mse']:.6f}",
-            flush=True,
-        )
-
-    vqbr_module = importlib.import_module("vqbr")
-    VariationalQuantumBayesianRegression = getattr(
-        vqbr_module, "VariationalQuantumBayesianRegression"
-    )
-    optimizer_configs = _resolve_vqbr_optimizer_configs(
-        args=args,
-        n_train_samples=int(X_train.shape[0]),
-    )
-    vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
-    vqbr_su2_gates = _parse_vqbr_su2_gates(args.vqbr_su2_gates)
-    for opt_cfg in optimizer_configs:
-        method_key = str(opt_cfg["method_key"])
-        optimizer_name = str(opt_cfg["optimizer"])
-        batch_mode = str(opt_cfg["batch_mode"])
-        batch_size_used = int(opt_cfg["batch_size_used"])
-        shuffle_batches = bool(opt_cfg["shuffle_batches"])
-
-        if args.log_realtime:
-            print(
-                "    "
-                f"[{prior_case}][seed={seed}][{method_key}] "
-                f"training start: optimizer={optimizer_name}, "
-                f"loss={vqbr_loss}, "
-                f"su2_gates={vqbr_su2_gates}, "
-                f"mode={batch_mode}, batch_size={batch_size_used}, "
-                f"shuffle_batches={shuffle_batches}",
-                flush=True,
-            )
-
-        vqbr = VariationalQuantumBayesianRegression(
-            shots=int(getattr(args, "vqbr_shots", 4096)),
-            batch_size=batch_size_used,
-            reps=args.vqbr_reps,
-            optimizer=optimizer_name,
-            maxiter=args.vqbr_maxiter,
-            shuffle_batches=shuffle_batches,
-            learning_rate=args.vqbr_learning_rate,
-            loss=vqbr_loss,
-            su2_gates=vqbr_su2_gates,
-            random_state=seed,
-            use_shot_noise=args.vqbr_use_shot_noise,
-            verbose=args.vqbr_verbose,
-            prefer_gpu=args.vqbr_prefer_gpu,
-            require_gpu=args.vqbr_require_gpu,
-        )
-        iteration_callback = None
-        if args.log_realtime:
-            iteration_callback = _make_vqbr_iteration_logger(
-                prior_case=prior_case,
-                seed=seed,
-                method_key=method_key,
-                optimizer=optimizer_name,
-                batch_mode=batch_mode,
-                batch_size=batch_size_used,
-                log_every_iter=args.log_every_iter,
-            )
-        fitted_state = vqbr.fit(
-            X_train,
-            y_train_centered,
-            m0_train,
-            sigma_diag_train,
-            V_selected,
-            iteration_callback=iteration_callback,
-        )
-        trained_circuit = _build_trained_circuit(vqbr)
-        statevector_from_circuit = _simulate_statevector_from_circuit(trained_circuit)
-
-        fit_state = np.asarray(fitted_state, dtype=complex).reshape(-1)
-        overlap = np.vdot(statevector_from_circuit, fit_state)
-        phase = np.exp(-1j * np.angle(overlap)) if np.abs(overlap) > EPS else 1.0 + 0.0j
-        fit_state_aligned = fit_state * phase
-        fit_vs_sim_l2 = float(np.linalg.norm(fit_state_aligned - statevector_from_circuit))
-
-        reconstructed_vector, encoding_vector = _reconstruct_vqbr_vector_from_state(
-            statevector_from_circuit,
-            w_star=w_star,
-        )
-        batch_loss_history = _collect_batch_loss_history(vqbr.history_)
-        finite_batch_losses = [x for x in batch_loss_history if np.isfinite(x)]
-        final_batch_L_hat = finite_batch_losses[-1] if finite_batch_losses else float("nan")
-        vqbr_metrics = _evaluate_vqbr_metrics(
-            reconstructed_vector=reconstructed_vector,
-            encoding_vector=encoding_vector,
-            w_star=w_star,
-            X_train=X_train,
-            y_train_raw=y_train_raw,
-            X_test=X_test,
-            y_test_raw=y_test_raw,
-            y_train_mean=y_train_mean,
-            final_batch_L_hat=final_batch_L_hat,
-            batch_loss_history=batch_loss_history,
-        )
-        vqbr_metrics["optimizer"] = optimizer_name
-        vqbr_metrics["batch_mode"] = batch_mode
-        vqbr_metrics["batch_size_used"] = int(batch_size_used)
-        vqbr_metrics["shuffle_batches"] = bool(shuffle_batches)
-        vqbr_metrics["loss"] = str(vqbr_loss)
-        vqbr_metrics["simulator_device"] = str(getattr(vqbr, "simulator_device_", "CPU"))
-        vqbr_metrics["simulator_backend"] = str(
-            getattr(vqbr, "simulator_backend_", "statevector_cpu")
-        )
-        vqbr_metrics["simulator_reason"] = str(
-            getattr(vqbr, "simulator_reason_", "Using CPU statevector simulator.")
-        )
-        vqbr_metrics["trained_circuit"] = _serialize_trained_circuit(trained_circuit)
-        vqbr_metrics["statevector_source"] = "simulated_from_trained_circuit"
-        vqbr_metrics["fit_vs_sim_state_l2"] = fit_vs_sim_l2
-        methods[method_key] = vqbr_metrics
-
-        if args.log_realtime:
-            print(
-                "    "
-                f"[{prior_case}][seed={seed}][{method_key}] "
-                f"simulator={vqbr_metrics['simulator_device']} "
-                f"({vqbr_metrics['simulator_backend']}), "
-                f"reason={vqbr_metrics['simulator_reason']}, "
-                f"cos={vqbr_metrics['cosine_similarity']:.6f}, "
-                f"rel_l2={vqbr_metrics['relative_l2_distance']:.6e}, "
-                f"train_mse={vqbr_metrics['train_mse']:.6f}, "
-                f"test_mse={vqbr_metrics['test_mse']:.6f}, "
-                f"batch_L_hat={vqbr_metrics['batch_L_hat']:.6e}",
-                flush=True,
-            )
-
-    return {
-        "seed": int(seed),
-        "split": {
-            "n_train_total": int(X_train.shape[0]),
-            "n_train_for_hyperparam": int(X_tune_train.shape[0]),
-            "n_val": int(X_val.shape[0]),
-            "n_test": int(X_test.shape[0]),
-            "train_ratio": float(args.train_ratio),
-            "test_ratio": float(1.0 - args.train_ratio),
-            "val_ratio_within_train": float(args.val_ratio_within_train),
-        },
-        "preprocessing": {
-            "feature_standardization": {
-                "fitted_on": "outer_train_split",
-                "mean": [float(x) for x in train_mean],
-                "std": [float(x) for x in train_std],
-            },
-            "target_centering": {
-                "fitted_on": "outer_train_split",
-                "mean": float(y_train_mean),
-            },
-        },
-        "selected_hyperparameters": {
-            "V": float(selected["V"]),
-            "lambda_strength": float(selected["lambda_strength"]),
-            "validation_mse": float(selected["validation_mse"]),
-            "prior_delta": float(args.prior_delta),
-        },
-        "methods": methods,
-    }
-
-
-def _prepare_seed_run(
-    *,
-    seed: int,
-    prior_case: str,
-    X: np.ndarray,
-    y: np.ndarray,
-    splits: SplitData,
-    V_grid: np.ndarray,
-    lambda_grid: np.ndarray,
-    args: argparse.Namespace,
-) -> PreparedSeedRun:
-    X_train_raw = X[splits.train_indices]
-    y_train_raw = y[splits.train_indices]
-    X_test_raw = X[splits.test_indices]
-    y_test_raw = y[splits.test_indices]
-
-    X_tune_train_raw = X[splits.train_val_indices]
-    y_tune_train_raw = y[splits.train_val_indices]
-    X_val_raw = X[splits.val_indices]
-    y_val_raw = y[splits.val_indices]
-
-    tune_mean, tune_std = _fit_feature_standardizer(X_tune_train_raw)
-    X_tune_train = _apply_feature_standardizer(X_tune_train_raw, tune_mean, tune_std)
-    X_val = _apply_feature_standardizer(X_val_raw, tune_mean, tune_std)
-    y_tune_mean, y_tune_train_centered = _fit_and_center_target(y_tune_train_raw)
-
-    selected = _select_hyperparameters(
-        prior_case=prior_case,
-        seed=seed,
-        X_train_for_tuning=X_tune_train,
-        y_train_for_tuning_centered=y_tune_train_centered,
-        y_train_for_tuning_mean=y_tune_mean,
-        X_train_for_prior_variance=X_tune_train_raw,
-        X_val=X_val,
-        y_val_raw=y_val_raw,
-        V_grid=V_grid,
-        lambda_grid=lambda_grid,
-        prior_delta=args.prior_delta,
-        log_realtime=args.log_realtime,
-        log_hyperparam_sweep=args.log_hyperparam_sweep,
-    )
-
     train_mean, train_std = _fit_feature_standardizer(X_train_raw)
     X_train = _apply_feature_standardizer(X_train_raw, train_mean, train_std)
     X_test = _apply_feature_standardizer(X_test_raw, train_mean, train_std)
@@ -1395,6 +1223,33 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     X, y, feature_cols = _load_energy_dataset(dataset_path=dataset_path, target_col=args.target_col)
     n_samples, n_features = X.shape
 
+    # Fix A: select global (V, lambda) once per prior_case (optional).
+    global_selected_by_case: Dict[str, Dict[str, float]] = {}
+    if bool(args.freeze_hyperparams):
+        for prior_case in PRIOR_CASES:
+            print(
+                f"[Global hyperparams] selecting (V, lambda) once using ref_seed={args.hyperparam_ref_seed} "
+                f"for prior_case={prior_case}",
+                flush=True,
+            )
+            global_selected_by_case[prior_case] = _select_global_hyperparameters(
+                prior_case=prior_case,
+                X=X,
+                y=y,
+                V_grid=V_grid,
+                lambda_grid=lambda_grid,
+                args=args,
+                ref_seed=int(args.hyperparam_ref_seed),
+            )
+            print(
+                "  "
+                f"Frozen hyperparams: V={global_selected_by_case[prior_case]['V']:.3e}, "
+                f"lambda={global_selected_by_case[prior_case]['lambda_strength']:.3e} "
+                f"(val_mse={global_selected_by_case[prior_case]['validation_mse']:.6f})",
+                flush=True,
+            )
+        print("", flush=True)
+
     result: Dict[str, Any] = {
         "dataset": {
             "path": str(dataset_path),
@@ -1412,6 +1267,9 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
             "V_grid": [float(x) for x in V_grid],
             "lambda_grid": [float(x) for x in lambda_grid],
             "prior_delta": float(args.prior_delta),
+            "freeze_hyperparams": bool(args.freeze_hyperparams),
+            "hyperparam_ref_seed": int(args.hyperparam_ref_seed),
+            "global_hyperparams": global_selected_by_case if bool(args.freeze_hyperparams) else None,
             "methods": ["closed_form", "vqbr_cobyla"],
             "vqbr": {
                 "optimizer": "COBYLA",
@@ -1478,6 +1336,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         f"entanglement={sorted({str(cfg.entanglement) for cfg in grid_configs})}, "
         f"loss={sorted({str(cfg.loss) for cfg in grid_configs})}"
     )
+    if bool(args.freeze_hyperparams):
+        print(f"Hyperparams: frozen globally (ref_seed={int(args.hyperparam_ref_seed)})")
     print("")
 
     training_rows: List[Dict[str, Any]] = []
@@ -1488,6 +1348,8 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
         case_seed_results: List[Dict[str, Any]] = []
         prepared_seed_runs: List[PreparedSeedRun] = []
         grid_metric_store: Dict[str, List[Dict[str, Any]]] = {cfg.config_id: [] for cfg in grid_configs}
+
+        frozen = global_selected_by_case.get(prior_case) if bool(args.freeze_hyperparams) else None
 
         for seed_index, seed in enumerate(seeds, start=1):
             print(f"  Seed {seed} ({seed_index}/{len(seeds)})", flush=True)
@@ -1506,6 +1368,7 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
                 V_grid=V_grid,
                 lambda_grid=lambda_grid,
                 args=args,
+                frozen_hyperparams=frozen,
             )
             prepared_seed_runs.append(prepared)
 
@@ -1678,7 +1541,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio-within-train", type=float, default=0.1)
-    parser.add_argument("--num-seeds", type=int, default=1)
+    parser.add_argument("--num-seeds", type=int, default=20)
     parser.add_argument("--seed-offset", type=int, default=0)
     parser.add_argument(
         "--seeds",
@@ -1698,6 +1561,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="1e-4,1e-3,1e-2,1e-1,1,10,100",
     )
     parser.add_argument("--prior-delta", type=float, default=1e-8)
+
+    # Fix A: freeze hyperparams globally
+    parser.add_argument(
+        "--freeze-hyperparams",
+        action="store_true",
+        help="If set, select (V, lambda) once using --hyperparam-ref-seed and reuse it for all seeds.",
+    )
+    parser.add_argument(
+        "--hyperparam-ref-seed",
+        type=int,
+        default=0,
+        help="Seed used to build the reference split for global (V, lambda) selection when --freeze-hyperparams is set.",
+    )
 
     parser.add_argument(
         "--vqbr-shots-grid",

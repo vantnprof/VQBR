@@ -16,19 +16,36 @@ plt.rcParams.update({"font.size": 9})
 
 METRIC_ORDER = (
     "cosine_similarity",
+    "relative_l2_distance",
     "euclidean_distance",
     "train_mse",
     "test_mse",
 )
+# Keep plotting focused on VQBR methods; table can include additional baselines.
 METHOD_ORDER = ("vqbr_cobyla", "vqbr_spsa", "vqbr")
+TABLE_METHOD_ORDER = ("closed_form",) + METHOD_ORDER
 METHOD_LABELS = {
     "vqbr_cobyla": "VQBR (COBYLA)",
     "vqbr_spsa": "VQBR (SPSA)",
     "vqbr": "VQBR",
 }
+TABLE_METHOD_LABELS = {
+    "closed_form": "Closed-form",
+    "vqbr_cobyla": "VQBR (COBYLA, reconstructed)",
+    "vqbr_spsa": "VQBR (SPSA, reconstructed)",
+    "vqbr": "VQBR (reconstructed)",
+}
+CONVERGENCE_METHOD = "vqbr_cobyla"
+CONVERGENCE_PAIR_ORDER = ("N16_D8", "N40_D8", "N80_D8")
+CONVERGENCE_PAIR_STYLES = {
+    "N16_D8": {"color": "#d62728", "marker": "o", "label": "N=16, D=8"},
+    "N40_D8": {"color": "#1f77b4", "marker": "s", "label": "N=40, D=8"},
+    "N80_D8": {"color": "#2ca02c", "marker": "^", "label": "N=80, D=8"},
+}
 PRIOR_KEY = "heteroscedastic"
 METRIC_LABELS = {
     "cosine_similarity": r"Cosine Similarity $\uparrow$",
+    "relative_l2_distance": r"Relative L2 Distance $\downarrow$",
     "euclidean_distance": r"Euclidean Distance $\downarrow$",
     "train_mse": r"Train MSE $\downarrow$",
     "test_mse": r"Test MSE $\downarrow$",
@@ -92,14 +109,14 @@ def _build_latex_table(data: Dict[str, Any], precision: int) -> str:
         nd_text = f"({N}, {D})"
 
         pair_label_printed = False
-        for method in METHOD_ORDER:
+        for method in TABLE_METHOD_ORDER:
             if method not in aggregate:
                 continue
             method_metrics = aggregate.get(method, {})
             row = [
                 pair_name if not pair_label_printed else "",
                 nd_text if not pair_label_printed else "",
-                METHOD_LABELS.get(method, method),
+                TABLE_METHOD_LABELS.get(method, METHOD_LABELS.get(method, method)),
             ]
             for metric in METRIC_ORDER:
                 stats = method_metrics.get(metric)
@@ -118,7 +135,7 @@ def _build_latex_table(data: Dict[str, Any], precision: int) -> str:
             wrote_any = True
 
     if not wrote_any:
-        raise ValueError("No aggregate VQBR metrics found under pair_results.*.prior_cases.")
+        raise ValueError("No aggregate metrics found under pair_results.*.prior_cases.")
 
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
@@ -154,8 +171,12 @@ def _plot_vqbr_convergence(
     height: float,
     dpi: int,
 ) -> None:
-    method_histories: Dict[str, List[List[float]]] = {}
+    selected_pairs = set(CONVERGENCE_PAIR_ORDER)
+    pair_histories: Dict[str, List[List[float]]] = {pair: [] for pair in CONVERGENCE_PAIR_ORDER}
+
     for pair_name, pair_block in _iter_pair_blocks(data):
+        if pair_name not in selected_pairs:
+            continue
         prior_cases = pair_block.get("prior_cases", {})
         prior_block = prior_cases.get(PRIOR_KEY)
         if not isinstance(prior_block, dict):
@@ -164,53 +185,57 @@ def _plot_vqbr_convergence(
         if not isinstance(per_seed, list):
             continue
 
-        for method in METHOD_ORDER:
-            for seed_result in per_seed:
-                if not isinstance(seed_result, dict):
-                    continue
-                vqbr_info = seed_result.get("methods", {}).get(method)
-                if not isinstance(vqbr_info, dict):
-                    continue
-                history = _extract_batch_loss_history(vqbr_info)
-                if history:
-                    method_histories.setdefault(method, []).append(history)
+        for seed_result in per_seed:
+            if not isinstance(seed_result, dict):
+                continue
+            vqbr_info = seed_result.get("methods", {}).get(CONVERGENCE_METHOD)
+            if not isinstance(vqbr_info, dict):
+                continue
+            history = _extract_batch_loss_history(vqbr_info)
+            if history:
+                pair_histories[pair_name].append(history)
 
-    if not method_histories:
+    missing_pairs = [pair for pair in CONVERGENCE_PAIR_ORDER if not pair_histories.get(pair)]
+    if missing_pairs:
+        raise ValueError(
+            "Missing convergence histories for pairs: "
+            + ", ".join(missing_pairs)
+            + f" using method={CONVERGENCE_METHOD}."
+        )
+
+    if not any(pair_histories.values()):
         raise ValueError(
             "No per-iteration VQBR batch loss history found in pair_results.*.prior_cases.*.per_seed."
         )
 
     fig, ax = plt.subplots(figsize=(width, height), dpi=dpi)
-    method_colors = {
-        "vqbr_cobyla": "#d62728",
-        "vqbr_spsa": "#1f77b4",
-        "vqbr": "#d62728",
-    }
 
     max_iter = 1
-    for method in METHOD_ORDER:
-        histories = method_histories.get(method, [])
-        if not histories:
-            continue
-        color = method_colors.get(method, "#333333")
-        label = METHOD_LABELS.get(method, method)
-
-        for history in histories:
-            x = np.arange(1, len(history) + 1)
-            ax.plot(x, history, color=color, alpha=0.08, linewidth=0.7)
-
+    for pair_name in CONVERGENCE_PAIR_ORDER:
+        histories = pair_histories[pair_name]
         hist_arr = _stack_histories(histories)
         mean_curve = np.nanmean(hist_arr, axis=0)
         std_curve = np.nanstd(hist_arr, axis=0, ddof=0)
         x = np.arange(1, mean_curve.size + 1)
-        ax.plot(x, mean_curve, color=color, linewidth=1.7, label=label)
+        style = CONVERGENCE_PAIR_STYLES[pair_name]
+        mark_every = max(1, int(round(mean_curve.size / 8)))
+        ax.plot(
+            x,
+            mean_curve,
+            color=style["color"],
+            marker=style["marker"],
+            markevery=mark_every,
+            markersize=3.5,
+            linewidth=1.7,
+            label=style["label"],
+        )
         if len(histories) > 1:
             ax.fill_between(
                 x,
                 mean_curve - std_curve,
                 mean_curve + std_curve,
-                alpha=0.16,
-                color=color,
+                alpha=0.12,
+                color=style["color"],
                 linewidth=0.0,
             )
         max_iter = max(max_iter, int(mean_curve.size))
@@ -220,12 +245,16 @@ def _plot_vqbr_convergence(
     elif max_iter <= 20:
         xticks = np.array(sorted(set([1, 5, 10, 15, max_iter])), dtype=float)
     else:
-        xticks = np.array([1, max(2, max_iter // 4), max(3, max_iter // 2), max_iter], dtype=float)
+        candidates = [1, 50, 100, 150, max_iter]
+        xticks = np.array(
+            sorted({int(v) for v in candidates if 1 <= int(v) <= max_iter}),
+            dtype=float,
+        )
     ax.set_xticks(xticks)
     ax.set_xticklabels([str(int(round(v))) for v in xticks])
 
     ax.set_xlabel("Iteration", fontsize=9)
-    ax.set_ylabel("Batch Loss", fontsize=9)
+    ax.set_ylabel(r"$\widehat{\widetilde{\mathcal{L}}}(\boldsymbol{\theta})$", fontsize=9)
     ax.tick_params(axis="both", labelsize=9)
     ax.grid(alpha=0.3, linestyle="--", linewidth=0.5)
     ax.legend(frameon=False, fontsize=8)
@@ -350,8 +379,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="results/synthetic/synthetic_test_mse_sweep.png",
     )
     parser.add_argument("--precision", type=int, default=4)
-    parser.add_argument("--fig-width", type=float, default=3.4)
-    parser.add_argument("--fig-height", type=float, default=2.6)
+    parser.add_argument("--fig-width", type=float, default=3.0)
+    parser.add_argument("--fig-height", type=float, default=2.5)
     parser.add_argument("--dpi", type=int, default=1000)
     return parser
 
