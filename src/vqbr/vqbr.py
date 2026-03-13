@@ -55,8 +55,10 @@ class VariationalQuantumBayesianRegression:
     Variational Quantum Bayesian Regression (VQBR).
 
     Notes:
-    - The current implementation follows the diagonal-prior estimator in the paper.
-      Therefore, `Sigma` is required to be diagonal.
+    - `Sigma0` can be provided as a 1D diagonal vector or a full SPD covariance matrix.
+      The precision `Sigma_0^{-1}` is computed classically.
+    - For dense (non-diagonal) `Sigma0`, `d_hat` is evaluated from the simulated
+      statevector exactly; shot-noise sampling is only applied in the diagonal case.
     - `fit` returns the trained statevector amplitudes prepared by the optimized ansatz.
     - If `qiskit-aer` is installed and a GPU device is available, training uses
       `AerSimulator(method="statevector", device="GPU")` automatically.
@@ -124,6 +126,9 @@ class VariationalQuantumBayesianRegression:
         self.simulator_backend_: str = "statevector_cpu"
         self.simulator_reason_: str = "Using CPU statevector simulator."
         self._statevector_backend: Optional[Any] = None
+        self._precision_matrix: Optional[np.ndarray] = None
+        self._precision_is_diagonal: bool = True
+        self._warned_dense_d_hat_shot_noise: bool = False
 
         if self.learning_rate is not None and self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be strictly positive when provided.")
@@ -133,7 +138,7 @@ class VariationalQuantumBayesianRegression:
         X: np.ndarray,
         y: np.ndarray,
         m0: np.ndarray,
-        Sigma: np.ndarray,
+        Sigma0: np.ndarray,
         V: float,
         iteration_callback: Optional[Callable[[int, ObjectiveSnapshot], None]] = None,
     ) -> np.ndarray:
@@ -148,13 +153,14 @@ class VariationalQuantumBayesianRegression:
             Targets.
         m0 : ndarray, shape (D,) or (D, 1)
             Prior mean.
-        Sigma : ndarray, shape (D,) or (D, D)
-            Diagonal prior covariance.
+        Sigma0 : ndarray, shape (D,) or (D, D)
+            Prior covariance (Sigma_0). Must be positive (1D) or symmetric
+            positive-definite (2D).
         V : float
             Prior-strength scaling in the MAP objective.
         """
         self._require_qiskit()
-        X, y, m0, sigma_diag, V = self._validate_and_prepare_inputs(X, y, m0, Sigma, V)
+        X, y, m0, Sigma0, V = self._validate_and_prepare_inputs(X, y, m0, Sigma0, V)
 
         n_samples, n_features = X.shape
         num_qubits = int(np.ceil(np.log2(n_features)))
@@ -171,7 +177,13 @@ class VariationalQuantumBayesianRegression:
         self._configure_statevector_backend()
         self._log_backend_selection()
 
-        precision_diag = 1.0 / sigma_diag
+        precision = self._precision_from_covariance(Sigma0)
+        precision = 0.5 * (precision + precision.T)
+        self._precision_matrix = precision
+        self._warned_dense_d_hat_shot_noise = False
+        precision_diag = np.diag(precision)
+        off_diag = precision - np.diag(precision_diag)
+        self._precision_is_diagonal = bool(np.allclose(off_diag, 0.0, atol=1e-12))
         self._precision_diag_padded = self._pad_to_pow2(precision_diag)
 
         self._row_norms = np.linalg.norm(X, axis=1)
@@ -182,7 +194,7 @@ class VariationalQuantumBayesianRegression:
             self._build_state_prep_gate(X[i], label=f"Ux_{i}") for i in range(n_samples)
         ]
 
-        c = V * precision_diag * m0
+        c = V * (precision @ m0)
         self._c_norm = float(np.linalg.norm(c))
         self._Uc_gate = None
         if self._c_norm > 0.0:
@@ -227,13 +239,13 @@ class VariationalQuantumBayesianRegression:
         X: np.ndarray,
         y: np.ndarray,
         m0: np.ndarray,
-        Sigma: np.ndarray,
+        Sigma0: np.ndarray,
         V: float,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
         X = np.asarray(X, dtype=float)
         y = np.asarray(y, dtype=float).reshape(-1)
         m0 = np.asarray(m0, dtype=float).reshape(-1)
-        Sigma = np.asarray(Sigma, dtype=float)
+        Sigma0 = np.asarray(Sigma0, dtype=float)
 
         if X.ndim != 2:
             raise ValueError(f"X must be 2D, got shape={X.shape}.")
@@ -244,37 +256,43 @@ class VariationalQuantumBayesianRegression:
         if m0.shape[0] != n_features:
             raise ValueError(f"m0 must have length {n_features}, got {m0.shape[0]}.")
 
-        sigma_diag: np.ndarray
-        if Sigma.ndim == 1:
-            if Sigma.shape[0] != n_features:
+        sigma0_matrix: np.ndarray
+        if Sigma0.ndim == 1:
+            if Sigma0.shape[0] != n_features:
                 raise ValueError(
-                    f"Sigma must have length {n_features}, got {Sigma.shape[0]}."
+                    f"Sigma0 must have length {n_features}, got {Sigma0.shape[0]}."
                 )
-            sigma_diag = Sigma.copy()
-        elif Sigma.ndim == 2:
-            if Sigma.shape != (n_features, n_features):
+            if np.any(Sigma0 <= 0.0):
+                raise ValueError("All entries of 1D Sigma0 must be positive.")
+            sigma0_matrix = np.diag(Sigma0.copy())
+        elif Sigma0.ndim == 2:
+            if Sigma0.shape != (n_features, n_features):
                 raise ValueError(
-                    f"Sigma must be ({n_features}, {n_features}), got {Sigma.shape}."
+                    f"Sigma0 must be ({n_features}, {n_features}), got {Sigma0.shape}."
                 )
-            if not np.allclose(Sigma, Sigma.T, atol=1e-12):
-                raise ValueError("Sigma must be symmetric.")
-            off_diag = Sigma - np.diag(np.diag(Sigma))
-            if not np.allclose(off_diag, 0.0, atol=1e-12):
-                raise ValueError(
-                    "This implementation currently supports only diagonal Sigma."
-                )
-            sigma_diag = np.diag(Sigma)
+            if not np.allclose(Sigma0, Sigma0.T, atol=1e-12):
+                raise ValueError("Sigma0 must be symmetric.")
+            try:
+                np.linalg.cholesky(Sigma0)
+            except np.linalg.LinAlgError as exc:
+                raise ValueError("Sigma0 must be positive definite.") from exc
+            sigma0_matrix = Sigma0.copy()
         else:
-            raise ValueError("Sigma must be either a 1D diagonal vector or a 2D matrix.")
-
-        if np.any(sigma_diag <= 0.0):
-            raise ValueError("All diagonal entries of Sigma must be positive.")
+            raise ValueError("Sigma0 must be either a 1D diagonal vector or a 2D matrix.")
 
         V = float(V)
         if V < 0.0:
             raise ValueError("V must be non-negative.")
 
-        return X, y, m0, sigma_diag, V
+        return X, y, m0, sigma0_matrix, V
+
+    @staticmethod
+    def _precision_from_covariance(Sigma0: np.ndarray) -> np.ndarray:
+        Sigma0 = np.asarray(Sigma0, dtype=float)
+        if Sigma0.ndim == 1:
+            return np.diag(1.0 / Sigma0)
+        eye = np.eye(Sigma0.shape[0], dtype=float)
+        return np.linalg.solve(Sigma0, eye)
 
     def _make_initial_point(self, n_params: int) -> np.ndarray:
         if self.initial_point is None:
@@ -773,17 +791,35 @@ class VariationalQuantumBayesianRegression:
         qc.compose(bound_ansatz, inplace=True)
 
         state = self._simulate_statevector(qc)
-        probs = np.abs(state) ** 2
-        probs = probs / np.sum(probs)
-
         apply_shot_noise = self.use_shot_noise if use_shot_noise is None else bool(use_shot_noise)
-        if apply_shot_noise:
-            counts = self._rng.multinomial(self.shots, probs)
-            # now includes V inside
-            return float(self._V * np.dot(self._precision_diag_padded, counts) / float(self.shots))
+        if self._precision_is_diagonal:
+            probs = np.abs(state) ** 2
+            probs = probs / np.sum(probs)
+            if apply_shot_noise:
+                counts = self._rng.multinomial(self.shots, probs)
+                # Includes V inside.
+                return float(
+                    self._V * np.dot(self._precision_diag_padded, counts) / float(self.shots)
+                )
 
-        # now includes V inside
-        return float(self._V * np.dot(self._precision_diag_padded, probs))
+            # Includes V inside.
+            return float(self._V * np.dot(self._precision_diag_padded, probs))
+
+        precision = self._precision_matrix
+        if precision is None:
+            raise RuntimeError("Precision matrix is unavailable. Ensure fit() was called.")
+
+        if apply_shot_noise and self.verbose and not self._warned_dense_d_hat_shot_noise:
+            print(
+                "Dense Sigma0 detected: d_hat is evaluated deterministically from the "
+                "statevector (shot-noise sampling is only used for diagonal precision)."
+            )
+            self._warned_dense_d_hat_shot_noise = True
+
+        state_features = np.asarray(state[: self._n_features], dtype=complex)
+        quad = float(np.real(np.vdot(state_features, precision @ state_features)))
+        quad = max(quad, 0.0)
+        return float(self._V * quad)
 
     def _objective_on_batch(
         self,
