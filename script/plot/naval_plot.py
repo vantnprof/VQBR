@@ -15,26 +15,23 @@ plt.rcParams.update({"font.size": 9})
 
 
 METRIC_ORDER = (
-    "cosine_similarity",
-    "euclidean_distance",
-    "train_mse",
-    "test_mse",
+    "train_rmse",
+    "test_rmse",
+    "train_r2",
+    "test_r2",
 )
-METHOD_ORDER = ("vqbr_cobyla", "vqbr_spsa", "vqbr")
+METHOD_ORDER = ("vqbr", "closed_form", "vqbr_cobyla", "vqbr_spsa")
 METHOD_LABELS = {
+    "closed_form": "Closed-form",
+    "vqbr": "VQBR",
     "vqbr_cobyla": "VQBR (COBYLA)",
     "vqbr_spsa": "VQBR (SPSA)",
-    "vqbr": "VQBR",
-}
-PRIOR_ORDER = ("heteroscedastic",)
-PRIOR_LABELS = {
-    "heteroscedastic": "Heteroscedastic",
 }
 METRIC_LABELS = {
-    "cosine_similarity": r"Cosine Similarity $\uparrow$",
-    "euclidean_distance": r"Euclidean Distance $\downarrow$",
-    "train_mse": r"Train MSE $\downarrow$",
-    "test_mse": r"Test MSE $\downarrow$",
+    "train_rmse": r"Train RMSE $\downarrow$",
+    "test_rmse": r"Test RMSE $\downarrow$",
+    "train_r2": r"Train $R^2$ $\uparrow$",
+    "test_r2": r"Test $R^2$ $\uparrow$",
 }
 
 
@@ -42,54 +39,84 @@ def _format_mean_std(mean: float, std: float, precision: int) -> str:
     return f"{mean:.{precision}f}$\\pm${std:.{precision}f}"
 
 
-def _build_latex_table(data: Dict[str, Any], precision: int) -> str:
+def _resolve_aggregate_block(data: Dict[str, Any]) -> Dict[str, Any]:
     prior_cases = data.get("prior_cases", {})
-    prior_block = prior_cases.get("heteroscedastic")
-    if prior_block is None:
-        raise ValueError("Missing heteroscedastic results under prior_cases['heteroscedastic'].")
-    aggregate = prior_block.get("aggregate", {})
+    if isinstance(prior_cases, dict):
+        prior_block = prior_cases.get("heteroscedastic")
+        if isinstance(prior_block, dict):
+            aggregate = prior_block.get("aggregate", {})
+            if isinstance(aggregate, dict) and aggregate:
+                return aggregate
+
+    aggregate = data.get("aggregate", {})
+    if isinstance(aggregate, dict) and aggregate:
+        return aggregate
+
+    raise ValueError(
+        "Missing aggregate metrics. Expected either top-level 'aggregate' or "
+        "prior_cases['heteroscedastic']['aggregate']."
+    )
+
+
+def _resolve_per_seed_entries(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    prior_cases = data.get("prior_cases", {})
+    if isinstance(prior_cases, dict):
+        prior_block = prior_cases.get("heteroscedastic")
+        if isinstance(prior_block, dict):
+            per_seed = prior_block.get("per_seed", [])
+            if isinstance(per_seed, list) and per_seed:
+                return [x for x in per_seed if isinstance(x, dict)]
+
+    per_seed = data.get("per_seed", [])
+    if isinstance(per_seed, list) and per_seed:
+        return [x for x in per_seed if isinstance(x, dict)]
+
+    raise ValueError(
+        "Missing per-seed entries. Expected either top-level 'per_seed' or "
+        "prior_cases['heteroscedastic']['per_seed']."
+    )
+
+
+def _build_latex_table(data: Dict[str, Any], precision: int) -> str:
+    aggregate = _resolve_aggregate_block(data)
+    methods = [method for method in METHOD_ORDER if method in aggregate]
+    if not methods:
+        methods = [k for k, v in aggregate.items() if isinstance(v, dict)]
+    if not methods:
+        raise ValueError("No aggregate methods were found in the result file.")
 
     lines: List[str] = []
     lines.append(r"\begin{table}[t]")
     lines.append(r"\centering")
-    lines.append(
-        r"\caption{Naval dataset results over random seeds (mean $\pm$ std).}"
-    )
-    lines.append(r"\begin{tabular}{ll" + ("c" * len(METRIC_ORDER)) + r"}")
+    lines.append(r"\caption{Naval dataset results over random seeds (mean $\pm$ std).}")
+    lines.append(r"\begin{tabular}{l" + ("c" * len(METRIC_ORDER)) + r"}")
     lines.append(r"\toprule")
-    lines.append(
-        "Prior & Method & "
-        + " & ".join(METRIC_LABELS[m] for m in METRIC_ORDER)
-        + r" \\"
-    )
+    lines.append("Method & " + " & ".join(METRIC_LABELS[m] for m in METRIC_ORDER) + r" \\")
     lines.append(r"\midrule")
 
-    for prior in PRIOR_ORDER:
-        prior_label_printed = False
-        for method in METHOD_ORDER:
-            if method not in aggregate:
+    wrote_row = False
+    for method in methods:
+        method_block = aggregate.get(method, {})
+        if not isinstance(method_block, dict):
+            continue
+        cells = [METHOD_LABELS.get(method, method)]
+        for metric in METRIC_ORDER:
+            stats = method_block.get(metric)
+            if not isinstance(stats, dict):
+                cells.append("--")
                 continue
-            cells = [
-                PRIOR_LABELS.get(prior, prior) if not prior_label_printed else "",
-                METHOD_LABELS.get(method, method),
-            ]
-            for metric in METRIC_ORDER:
-                stats = aggregate[method].get(metric)
-                if stats is None:
-                    cells.append("--")
-                    continue
-                cells.append(
-                    _format_mean_std(
-                        mean=float(stats["mean"]),
-                        std=float(stats["std"]),
-                        precision=precision,
-                    )
+            cells.append(
+                _format_mean_std(
+                    mean=float(stats["mean"]),
+                    std=float(stats["std"]),
+                    precision=precision,
                 )
-            lines.append(" & ".join(cells) + r" \\")
-            prior_label_printed = True
+            )
+        lines.append(" & ".join(cells) + r" \\")
+        wrote_row = True
 
-    if lines[-1] == r"\midrule":
-        raise ValueError("No aggregate VQBR metrics were found in the result file.")
+    if not wrote_row:
+        raise ValueError("No aggregate metric rows were found in the result file.")
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
     lines.append(r"\end{table}")
@@ -110,7 +137,7 @@ def _stack_histories(histories: List[List[float]]) -> np.ndarray:
 
 
 def _extract_batch_loss_history(vqbr_info: Dict[str, Any]) -> List[float]:
-    for key in ("batch_loss_history", "loss_history"):
+    for key in ("objective_history", "batch_loss_history", "loss_history"):
         values = vqbr_info.get(key)
         if isinstance(values, list) and values:
             return [float(x) for x in values]
@@ -123,13 +150,10 @@ def _plot_vqbr_convergence(
     width: float,
     height: float,
     dpi: int,
+    show_seed_traces: bool,
+    title: str,
 ) -> None:
-    prior_cases = data.get("prior_cases", {})
-    prior_block = prior_cases.get("heteroscedastic")
-    if prior_block is None:
-        raise ValueError("Missing heteroscedastic results under prior_cases['heteroscedastic'].")
-
-    per_seed = prior_block.get("per_seed", [])
+    per_seed = _resolve_per_seed_entries(data)
     method_histories: Dict[str, List[List[float]]] = {}
     for method in METHOD_ORDER:
         histories: List[List[float]] = []
@@ -145,15 +169,15 @@ def _plot_vqbr_convergence(
 
     if not method_histories:
         raise ValueError(
-            "No per-iteration VQBR batch loss history found. Expected one of "
-            "methods.vqbr_cobyla.batch_loss_history or methods.vqbr_spsa.batch_loss_history."
+            "No per-iteration VQBR objective history found in per-seed methods."
         )
 
     fig, ax = plt.subplots(figsize=(width, height), dpi=dpi)
     method_colors = {
+        "closed_form": "#7f7f7f",
+        "vqbr": "#d62728",
         "vqbr_cobyla": "#d62728",
         "vqbr_spsa": "#1f77b4",
-        "vqbr": "#d62728",
     }
     max_iter = 1
     for method in METHOD_ORDER:
@@ -162,9 +186,10 @@ def _plot_vqbr_convergence(
             continue
         color = method_colors.get(method, "#333333")
         label = METHOD_LABELS.get(method, method)
-        for history in histories:
-            x = np.arange(1, len(history) + 1)
-            ax.plot(x, history, color=color, alpha=0.16, linewidth=0.7)
+        if show_seed_traces:
+            for history in histories:
+                x = np.arange(1, len(history) + 1)
+                ax.plot(x, history, color=color, alpha=0.16, linewidth=0.7)
 
         hist_arr = _stack_histories(histories)
         mean_curve = np.nanmean(hist_arr, axis=0)
@@ -193,20 +218,23 @@ def _plot_vqbr_convergence(
     ax.set_xticklabels(xlabels)
 
     ax.set_xlabel("Iteration", fontsize=9)
-    ax.set_ylabel("Batch Loss", fontsize=9)
+    ax.set_ylabel(r"$\widehat{\mathcal{J}}_{\log}(\boldsymbol{\theta})$", fontsize=9)
+    ax.set_title(title, fontsize=9)
+    x_edge_pad = 1.5
+    ax.set_xlim(1.0 - x_edge_pad, float(max_iter) + x_edge_pad)
     ax.tick_params(axis="both", labelsize=9)
     ax.grid(alpha=0.3, linestyle="--", linewidth=0.5)
     ax.legend(frameon=False, fontsize=8)
-    fig.tight_layout()
+    fig.tight_layout(pad=0.2)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Load heteroscedastic-prior naval experiment results and produce a LaTeX table "
+            "Load naval experiment results and produce a LaTeX table "
             "plus VQBR convergence plot."
         )
     )
@@ -229,6 +257,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fig-width", type=float, default=3.0)
     parser.add_argument("--fig-height", type=float, default=2.5)
     parser.add_argument("--dpi", type=int, default=1000)
+
+    parser.set_defaults(show_seed_traces=False)
+    parser.add_argument("--show-seed-traces", action="store_true")
+    parser.add_argument("--hide-seed-traces", dest="show_seed_traces", action="store_false")
     return parser
 
 
@@ -242,6 +274,11 @@ def main() -> None:
 
     with results_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
+
+    dataset_info = data.get("dataset", {})
+    n_samples = dataset_info.get("n_samples", "?")
+    n_features = dataset_info.get("n_features", "?")
+    title = rf"$N={n_samples},\ D={n_features}$"
 
     latex_table = _build_latex_table(data, precision=args.precision)
     table_path.parent.mkdir(parents=True, exist_ok=True)
@@ -257,6 +294,8 @@ def main() -> None:
         width=args.fig_width,
         height=args.fig_height,
         dpi=args.dpi,
+        show_seed_traces=bool(args.show_seed_traces),
+        title=title,
     )
     print(f"Convergence plot saved to: {convergence_plot_path}")
 

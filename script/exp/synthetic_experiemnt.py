@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import redirect_stderr, redirect_stdout
-import importlib
+import csv
 import json
-import re
+import shlex
 import sys
+import time
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
 import numpy as np
 
@@ -22,407 +24,71 @@ for module_dir in ("closed_form", "vqbr"):
         sys.path.insert(0, str(module_path))
 
 from closed_form import ClosedFormMAPBayesianRegression  # noqa: E402
+from vqbr import VariationalQuantumBayesianRegression  # noqa: E402
 
 
 EPS = 1e-12
-METHOD_KEYS = ("vqbr_cobyla",)
-METRIC_KEYS = (
+VQBR_METRIC_KEYS = (
     "cosine_similarity",
-    "relative_l2_distance",
-    "train_mse",
-    "test_mse",
+    "feature_cosine_similarity",
+    "state_overlap_abs",
+    "train_rmse",
+    "test_rmse",
+    "train_r2",
+    "test_r2",
+    "t_hat",
+    "final_objective",
 )
-PRIOR_CASES = ("heteroscedastic",)
-VQBR_OPTIMIZER_SETTINGS = (
-    {
-        "method_key": "vqbr_cobyla",
-        "optimizer": "COBYLA",
-        "use_full_batch": True,
-        "batch_mode": "full_data",
-    },
+CLOSED_FORM_METRIC_KEYS = (
+    "train_rmse",
+    "test_rmse",
+    "train_r2",
+    "test_r2",
 )
 
-PAIR_RE = re.compile(r"^N(?P<N>\d+)_D(?P<D>\d+)$")
+ENFORCED_VQBR_OPTIMIZER = "COBYLA"
+ENFORCED_VQBR_LOSS = "log_ratio"
+ENFORCED_VQBR_SU2_GATES: tuple[str, ...] = ("ry", "x")
+LOG_RATIO_LOSS_FORMULA = "log(a_hat + d_hat + eps) - log((c_hat + e_hat)^2 + eps)"
+DEFAULT_RESULTS_ROOT = ROOT_DIR / "results" / "synthetic"
 
 
 @dataclass
-class InnerSplit:
-    train_tune_indices: np.ndarray
-    val_indices: np.ndarray
+class SplitIndices:
+    prior_indices: np.ndarray
+    train_indices: np.ndarray
+    test_indices: np.ndarray
 
 
-def _fit_feature_standardizer(X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    X = np.asarray(X, dtype=float)
-    if X.ndim != 2:
-        raise ValueError("X must be 2D for feature standardization.")
-    mean = np.mean(X, axis=0)
-    std = np.std(X, axis=0, ddof=0)
-    std_safe = np.where(std > EPS, std, 1.0)
-    return mean, std_safe
-
-
-def _apply_feature_standardizer(X: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
-    X = np.asarray(X, dtype=float)
-    mean = np.asarray(mean, dtype=float).reshape(-1)
-    std = np.asarray(std, dtype=float).reshape(-1)
-    if X.ndim != 2:
-        raise ValueError("X must be 2D for feature standardization.")
-    if X.shape[1] != mean.shape[0] or X.shape[1] != std.shape[0]:
-        raise ValueError("Feature dimensions do not match fitted standardizer.")
-    return (X - mean[None, :]) / std[None, :]
-
-
-def _fit_and_center_target(y: np.ndarray) -> tuple[float, np.ndarray]:
-    y = np.asarray(y, dtype=float).reshape(-1)
-    mean = float(np.mean(y))
-    return mean, y - mean
-
-
-def _make_inner_split(n_train_total: int, val_ratio_within_train: float, seed: int) -> InnerSplit:
-    if n_train_total <= 1:
-        raise ValueError("Need at least 2 training samples for inner split.")
-    if not (0.0 < val_ratio_within_train < 1.0):
-        raise ValueError("val_ratio_within_train must be in (0, 1).")
-
-    rng = np.random.default_rng(seed + 1_009)
-    order = rng.permutation(n_train_total)
-    n_val = int(np.floor(val_ratio_within_train * n_train_total))
-    n_val = min(max(1, n_val), n_train_total - 1)
-    val_indices = order[:n_val]
-    train_tune_indices = order[n_val:]
-    return InnerSplit(train_tune_indices=train_tune_indices, val_indices=val_indices)
-
-
-def _make_vqbr_iteration_logger(
-    *,
-    prior_case: str,
-    pair_name: str,
-    seed: int,
-    method_key: str,
-    optimizer: str,
-    batch_mode: str,
-    batch_size: int,
-    log_every_iter: int,
-) -> Any:
-    if log_every_iter <= 0:
-        raise ValueError("--log-every-iter must be a positive integer.")
-    prev_batch_loss: float | None = None
-
-    def _format_delta(current: float, previous: float | None) -> str:
-        if previous is None:
-            return "delta=--"
-        if not np.isfinite(current) or not np.isfinite(previous):
-            return "delta=n/a"
-        diff = float(current - previous)
-        if diff > 0.0:
-            return f"delta=↑ {abs(diff):.6e}"
-        if diff < 0.0:
-            return f"delta=↓ {abs(diff):.6e}"
-        return "delta=→ 0.000000e+00"
-
-    def _callback(iteration: int, snapshot: Any) -> None:
-        nonlocal prev_batch_loss
-        batch_loss = float(getattr(snapshot, "batch_L_tilde", np.nan))
-        if not np.isfinite(batch_loss):
-            batch_loss = float(getattr(snapshot, "L_tilde", np.nan))
-        delta_text = _format_delta(batch_loss, prev_batch_loss)
-        should_log = (iteration == 1) or (iteration % log_every_iter == 0)
-        if should_log:
-            print(
-                "    "
-                f"[{pair_name}][{prior_case}][seed={seed}][{method_key}] "
-                f"{optimizer} iter {iteration:>4d} | "
-                f"mode={batch_mode}, batch_size={batch_size} | "
-                f"batch_loss={batch_loss: .6e}, {delta_text}",
-                flush=True,
-            )
-        prev_batch_loss = batch_loss
-
-    return _callback
-
-
-def _parse_float_grid(raw: str) -> np.ndarray:
-    tokens = [x.strip() for x in raw.split(",") if x.strip()]
-    if not tokens:
-        raise ValueError("Grid specification cannot be empty.")
-    values = np.array([float(x) for x in tokens], dtype=float)
-    if np.any(values <= 0.0):
-        raise ValueError("All grid values must be strictly positive.")
-    return values
-
-
-def _parse_int_list(raw: str) -> List[int]:
-    tokens = [x.strip() for x in raw.split(",") if x.strip()]
-    if not tokens:
-        return []
-    return [int(x) for x in tokens]
-
-
-def _resolve_seeds(
-    explicit_seeds: str | None,
-    num_seeds: int | None,
-    seed_offset: int,
-    manifest_seeds: Sequence[int],
-) -> List[int]:
+def _resolve_seeds(num_seeds: int, seed_offset: int, explicit_seeds: str | None) -> List[int]:
     if explicit_seeds is not None:
-        seeds = [int(x.strip()) for x in explicit_seeds.split(",") if x.strip()]
-        if not seeds:
+        tokens = [token.strip() for token in explicit_seeds.split(",") if token.strip()]
+        if not tokens:
             raise ValueError("--seeds was provided but no valid integers were found.")
-        return seeds
+        return [int(token) for token in tokens]
 
-    if num_seeds is not None:
-        if num_seeds <= 0:
-            raise ValueError("--num-seeds must be positive when provided.")
-        return [seed_offset + i for i in range(num_seeds)]
-
-    if manifest_seeds:
-        return [int(x) for x in manifest_seeds]
-
-    raise ValueError(
-        "Unable to resolve seed list. Provide --seeds, --num-seeds, or a manifest with seeds."
-    )
-
-
-def _parse_vqbr_optimizer_names(raw: str) -> List[str]:
-    tokens = [x.strip().upper() for x in raw.split(",") if x.strip()]
-    if not tokens:
-        raise ValueError("--vqbr-optimizer must include at least one optimizer name.")
-
-    valid = {str(setting["optimizer"]).upper() for setting in VQBR_OPTIMIZER_SETTINGS}
-    invalid = sorted({token for token in tokens if token not in valid})
-    if invalid:
-        raise ValueError(
-            "Unsupported --vqbr-optimizer values: "
-            f"{', '.join(invalid)}. Supported values: {', '.join(sorted(valid))}."
-        )
-
-    unique_tokens: List[str] = []
-    for token in tokens:
-        if token not in unique_tokens:
-            unique_tokens.append(token)
-    return unique_tokens
-
-
-class _TeeStream:
-    """Mirror writes to multiple stream-like objects."""
-
-    def __init__(self, *streams: Any):
-        self._streams = streams
-
-    def write(self, data: str) -> int:
-        for stream in self._streams:
-            stream.write(data)
-        return len(data)
-
-    def flush(self) -> None:
-        for stream in self._streams:
-            stream.flush()
-
-
-def _select_vqbr_optimizer_settings(raw: str) -> List[Dict[str, Any]]:
-    selected_optimizer_names = _parse_vqbr_optimizer_names(raw)
-    settings_by_optimizer = {
-        str(setting["optimizer"]).upper(): setting for setting in VQBR_OPTIMIZER_SETTINGS
-    }
-    return [settings_by_optimizer[name] for name in selected_optimizer_names]
-
-
-def _normalize_vqbr_loss(raw: str) -> str:
-    mode = str(raw).strip().lower()
-    aliases = {
-        "log_ratio": "log_ratio",
-        "log": "log_ratio",
-        "neg_ratio": "neg_ratio",
-        "ratio": "neg_ratio",
-        "raw_ratio": "neg_ratio",
-    }
-    resolved = aliases.get(mode)
-    if resolved is None:
-        raise ValueError(
-            "Unsupported --vqbr-loss value. Supported values: "
-            "log_ratio, neg_ratio (aliases: log, ratio, raw_ratio)."
-        )
-    return resolved
-
-
-def _load_manifest(dataset_root: Path) -> Dict[str, Any]:
-    manifest_path = dataset_root / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"Synthetic manifest not found at {manifest_path}. "
-            "Generate data first with data/synthetic/data_synthetic.py"
-        )
-    with manifest_path.open("r", encoding="utf-8") as f:
-        manifest = json.load(f)
-    if not isinstance(manifest, dict):
-        raise ValueError("manifest.json must contain a JSON object.")
-    return manifest
-
-
-def _parse_pair_name(pair_name: str) -> tuple[int, int]:
-    m = PAIR_RE.match(pair_name)
-    if m is None:
-        raise ValueError(
-            f"Invalid pair name '{pair_name}'. Expected format N{{N}}_D{{D}} (e.g., N80_D16)."
-        )
-    return int(m.group("N")), int(m.group("D"))
-
-
-def _resolve_pair_names(
-    manifest: Dict[str, Any],
-    explicit_pairs: str | None,
-    dataset_root: Path,
-) -> List[str]:
-    if explicit_pairs is not None:
-        pair_names = [x.strip() for x in explicit_pairs.split(",") if x.strip()]
-        if not pair_names:
-            raise ValueError("--pairs was provided but no valid pair names were found.")
-        for pair_name in pair_names:
-            _parse_pair_name(pair_name)
-        return pair_names
-
-    manifest_pairs = manifest.get("pairs", [])
-    if isinstance(manifest_pairs, list) and manifest_pairs:
-        names: List[str] = []
-        for pair_info in manifest_pairs:
-            if not isinstance(pair_info, dict):
-                continue
-            pair_name = pair_info.get("pair_name")
-            if isinstance(pair_name, str):
-                names.append(pair_name)
-        if names:
-            return sorted(
-                set(names),
-                key=lambda x: (_parse_pair_name(x)[1], _parse_pair_name(x)[0]),
-            )
-
-    # Fallback to folder discovery.
-    pair_names = []
-    for p in sorted(dataset_root.glob("N*_D*")):
-        if p.is_dir():
-            _parse_pair_name(p.name)
-            pair_names.append(p.name)
-    if not pair_names:
-        raise ValueError("No synthetic pair folders found under dataset root.")
-    return pair_names
-
-
-def _manifest_pair_metadata(manifest: Dict[str, Any], pair_name: str) -> Dict[str, Any]:
-    manifest_pairs = manifest.get("pairs", [])
-    if isinstance(manifest_pairs, list):
-        for pair_info in manifest_pairs:
-            if isinstance(pair_info, dict) and pair_info.get("pair_name") == pair_name:
-                return dict(pair_info)
-
-    N, D = _parse_pair_name(pair_name)
-    padded_dim = 2 ** int(np.ceil(np.log2(D)))
-    d = int(np.log2(padded_dim))
-    return {
-        "pair_name": pair_name,
-        "N": int(N),
-        "D": int(D),
-        "d": int(d),
-        "padded_dim": int(padded_dim),
-    }
-
-
-def _load_pair_seed_split(
-    dataset_root: Path,
-    pair_name: str,
-    seed: int,
-    use_padded_features: bool,
-) -> Dict[str, Any]:
-    seed_dir = dataset_root / pair_name / f"seed_{int(seed):04d}"
-    if not seed_dir.exists():
-        raise FileNotFoundError(
-            f"Missing split directory for pair={pair_name}, seed={seed}: {seed_dir}"
-        )
-
-    train_path = seed_dir / "train.npz"
-    test_path = seed_dir / "test.npz"
-    meta_path = seed_dir / "split_meta.json"
-    params_path = seed_dir / "params.npz"
-
-    if not train_path.exists() or not test_path.exists():
-        raise FileNotFoundError(
-            f"Missing train/test files for pair={pair_name}, seed={seed}."
-        )
-
-    with np.load(train_path) as train_data, np.load(test_path) as test_data:
-        x_key = "X_padded" if use_padded_features and "X_padded" in train_data.files else "X"
-        if x_key not in train_data.files or x_key not in test_data.files:
-            raise KeyError(
-                f"Expected key '{x_key}' in both train/test npz files for pair={pair_name}, seed={seed}."
-            )
-        if "y" not in train_data.files or "y" not in test_data.files:
-            raise KeyError("Expected key 'y' in both train/test npz files.")
-
-        X_train = np.asarray(train_data[x_key], dtype=float)
-        y_train = np.asarray(train_data["y"], dtype=float).reshape(-1)
-        X_test = np.asarray(test_data[x_key], dtype=float)
-        y_test = np.asarray(test_data["y"], dtype=float).reshape(-1)
-
-    if X_train.ndim != 2 or X_test.ndim != 2:
-        raise ValueError("Loaded train/test feature matrices must be 2D.")
-    if X_train.shape[1] != X_test.shape[1]:
-        raise ValueError("Train/test feature dimensions do not match.")
-    if X_train.shape[0] != y_train.shape[0] or X_test.shape[0] != y_test.shape[0]:
-        raise ValueError("Train/test feature-target sizes do not match.")
-
-    split_meta: Dict[str, Any] = {}
-    if meta_path.exists():
-        with meta_path.open("r", encoding="utf-8") as f:
-            raw_meta = json.load(f)
-        if isinstance(raw_meta, dict):
-            split_meta = raw_meta
-
-    params_meta: Dict[str, Any] = {}
-    if params_path.exists():
-        with np.load(params_path) as params_data:
-            for key in ("N", "D", "d", "padded_dim", "noise_std", "seed"):
-                if key in params_data.files:
-                    value = params_data[key]
-                    if np.asarray(value).shape == ():
-                        params_meta[key] = float(value) if key == "noise_std" else int(value)
-
-    return {
-        "X_train": X_train,
-        "y_train": y_train,
-        "X_test": X_test,
-        "y_test": y_test,
-        "split_meta": split_meta,
-        "params_meta": params_meta,
-        "seed_dir": str(seed_dir),
-    }
-
-
-def _build_prior(
-    prior_case: str,
-    X_reference: np.ndarray,
-    lambda_strength: float,
-    delta: float,
-    variance_reference: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    n_features = X_reference.shape[1]
-    m0 = np.zeros(n_features, dtype=float)
-
-    if prior_case != "heteroscedastic":
-        raise ValueError(
-            f"Unsupported prior case: {prior_case}. "
-            "This experiment only supports 'heteroscedastic'."
-        )
-
-    ref = X_reference if variance_reference is None else variance_reference
-    feature_var = np.var(ref, axis=0, ddof=0)
-    feature_var = np.maximum(feature_var, 0.0)
-    precision_diag = lambda_strength / (feature_var + delta)
-    sigma_diag = 1.0 / precision_diag
-    return m0, sigma_diag
+    if num_seeds <= 0:
+        raise ValueError("--num-seeds must be positive.")
+    return [int(seed_offset) + i for i in range(int(num_seeds))]
 
 
 def _mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     err = np.asarray(y_pred, dtype=float).reshape(-1) - np.asarray(y_true, dtype=float).reshape(-1)
     return float(np.mean(err * err))
+
+
+def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float(np.sqrt(max(_mse(y_true, y_pred), 0.0)))
+
+
+def _r2_score(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+    ss_res = float(np.sum((y_true - y_pred) ** 2))
+    ss_tot = float(np.sum((y_true - np.mean(y_true)) ** 2))
+    if ss_tot <= EPS:
+        return 1.0 if ss_res <= EPS else 0.0
+    return float(1.0 - (ss_res / ss_tot))
 
 
 def _safe_cosine(a: np.ndarray, b: np.ndarray, eps: float = EPS) -> float:
@@ -435,6 +101,27 @@ def _safe_cosine(a: np.ndarray, b: np.ndarray, eps: float = EPS) -> float:
     if na <= eps or nb <= eps:
         return 0.0
     return float(np.dot(a, b) / (na * nb))
+
+
+def _pad_to_pow2(vec: np.ndarray) -> np.ndarray:
+    vec = np.asarray(vec)
+    if vec.ndim != 1:
+        raise ValueError("Expected a 1D vector.")
+    if vec.size == 0:
+        raise ValueError("Vector must not be empty.")
+    n = int(np.ceil(np.log2(vec.size)))
+    m = 2**n
+    if m == vec.size:
+        return vec.copy()
+    return np.pad(vec, (0, m - vec.size), mode="constant")
+
+
+def _normalize_state(state: np.ndarray) -> np.ndarray:
+    state = np.asarray(state, dtype=complex).reshape(-1)
+    norm = float(np.linalg.norm(state))
+    if norm <= EPS:
+        raise RuntimeError("Zero-norm state encountered.")
+    return state / norm
 
 
 def _state_to_feature_direction(
@@ -467,714 +154,1478 @@ def _state_to_feature_direction(
     return direction / direction_norm
 
 
-def _collect_batch_loss_history(vqbr_history: List[Any]) -> List[float]:
-    losses: List[float] = []
-    for snapshot in vqbr_history:
+def _feature_direction_from_final_overlaps(
+    vqbr_model: VariationalQuantumBayesianRegression,
+    X_train: np.ndarray,
+    eps: float = EPS,
+) -> np.ndarray | None:
+    """Recover feature direction from signed final overlaps r_i * s_i = x_i^T phi.
+
+    This avoids sign loss from statevector phase-gauge projection and keeps
+    reconstruction consistent with the same overlap convention used in c_hat/e_hat.
+    """
+    try:
+        theta = np.asarray(getattr(vqbr_model, "theta_"), dtype=float).reshape(-1)
+        n_samples = int(np.asarray(X_train, dtype=float).shape[0])
+        if n_samples <= 0:
+            return None
+
+        overlaps = np.array(
+            [
+                float(
+                    vqbr_model._estimate_overlap(
+                        vqbr_model._Uxi_gates[i],
+                        theta,
+                        use_shot_noise=vqbr_model.use_shot_noise,
+                    )
+                )
+                for i in range(n_samples)
+            ],
+            dtype=float,
+        )
+        row_norms = np.asarray(getattr(vqbr_model, "_row_norms"), dtype=float).reshape(-1)
+        if row_norms.shape[0] != n_samples:
+            return None
+
+        z = row_norms * overlaps
+        phi_ls, *_ = np.linalg.lstsq(np.asarray(X_train, dtype=float), z, rcond=None)
+        phi_ls = np.asarray(phi_ls, dtype=float).reshape(-1)
+        norm = float(np.linalg.norm(phi_ls))
+        if norm <= eps:
+            return None
+        return phi_ls / norm
+    except Exception:
+        return None
+
+
+def _normalized_closed_form_state(w_closed: np.ndarray) -> np.ndarray:
+    state = _pad_to_pow2(np.asarray(w_closed, dtype=complex).reshape(-1))
+    norm = float(np.linalg.norm(state))
+    if norm <= EPS:
+        out = np.zeros_like(state, dtype=complex)
+        out[0] = 1.0 + 0.0j
+        return out
+    return state / norm
+
+
+def _generate_synthetic_data(
+    n_samples: int,
+    n_features: int,
+    noise_std: float,
+    w_true_std: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal(size=(n_samples, n_features))
+    w_true = rng.normal(0.0, w_true_std, size=n_features)
+    noise = rng.normal(0.0, noise_std, size=n_samples)
+    y = X @ w_true + noise
+    return X, y, w_true
+
+
+def _split_dataset_indices(
+    n_samples: int,
+    prior_ratio: float,
+    train_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> SplitIndices:
+    if n_samples <= 2:
+        raise ValueError("n_samples must be > 2.")
+    ratio_sum = float(prior_ratio + train_ratio + test_ratio)
+    if not np.isclose(ratio_sum, 1.0, atol=1e-12):
+        raise ValueError(
+            f"Split ratios must sum to 1.0. Got prior+train+test={ratio_sum:.12f}."
+        )
+    if prior_ratio <= 0.0 or train_ratio <= 0.0 or test_ratio <= 0.0:
+        raise ValueError("All split ratios must be positive.")
+
+    n_prior = int(np.floor(prior_ratio * n_samples))
+    n_train = int(np.floor(train_ratio * n_samples))
+    n_test = int(n_samples - n_prior - n_train)
+    if n_prior < 1 or n_train < 1 or n_test < 1:
+        raise ValueError(
+            "Invalid split sizes. Increase n_samples or adjust ratios so prior/train/test are non-empty."
+        )
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_samples)
+    prior_indices = perm[:n_prior]
+    train_indices = perm[n_prior : n_prior + n_train]
+    test_indices = perm[n_prior + n_train :]
+    return SplitIndices(
+        prior_indices=prior_indices,
+        train_indices=train_indices,
+        test_indices=test_indices,
+    )
+
+
+def _ridge_solution(X: np.ndarray, y: np.ndarray, ridge: float) -> np.ndarray:
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    d = int(X.shape[1])
+    gram = X.T @ X + float(ridge) * np.eye(d, dtype=float)
+    rhs = X.T @ y
+    return np.linalg.solve(gram, rhs)
+
+
+def _estimate_prior_from_prior_split(
+    X_prior: np.ndarray,
+    y_prior: np.ndarray,
+    *,
+    seed: int,
+    bootstrap_samples: int,
+    ridge: float,
+    sigma_floor: float,
+    v_floor: float,
+) -> tuple[np.ndarray, np.ndarray, float, Dict[str, float]]:
+    if bootstrap_samples <= 0:
+        raise ValueError("--prior-bootstrap-samples must be positive.")
+    if ridge < 0.0:
+        raise ValueError("--prior-ridge must be non-negative.")
+    if sigma_floor <= 0.0:
+        raise ValueError("--prior-sigma-floor must be positive.")
+    if v_floor <= 0.0:
+        raise ValueError("--V-floor must be positive.")
+
+    X_prior = np.asarray(X_prior, dtype=float)
+    y_prior = np.asarray(y_prior, dtype=float).reshape(-1)
+    n_prior, d = X_prior.shape
+    if y_prior.shape[0] != n_prior:
+        raise ValueError("Prior split X/y shape mismatch.")
+
+    rng = np.random.default_rng(seed + 77_777)
+    weights = np.zeros((bootstrap_samples, d), dtype=float)
+    for i in range(bootstrap_samples):
+        idx = rng.integers(0, n_prior, size=n_prior)
+        weights[i] = _ridge_solution(X_prior[idx], y_prior[idx], ridge=ridge)
+
+    m0 = np.mean(weights, axis=0)
+    sigma_diag = np.var(weights, axis=0, ddof=0)
+    sigma_diag = np.maximum(sigma_diag, float(sigma_floor))
+    Sigma0 = np.diag(sigma_diag)
+
+    y_prior_pred = np.asarray(X_prior, dtype=float) @ np.asarray(m0, dtype=float)
+    prior_fit_mse = _mse(y_prior, y_prior_pred)
+    V = max(prior_fit_mse, float(v_floor))
+
+    prior_info = {
+        "bootstrap_samples": float(bootstrap_samples),
+        "ridge": float(ridge),
+        "sigma_floor": float(sigma_floor),
+        "v_floor": float(v_floor),
+        "V": float(V),
+        "prior_fit_mse": float(prior_fit_mse),
+        "mean_sigma0_diag": float(np.mean(sigma_diag)),
+    }
+    return m0, Sigma0, float(V), prior_info
+
+
+def _build_training_logger(
+    *,
+    seed: int,
+    maxiter: int,
+    log_every_iter: int,
+) -> Any:
+    if log_every_iter <= 0:
+        raise ValueError("--log-every-iter must be positive.")
+    prev_loss: float | None = None
+
+    def _format_delta(current: float, previous: float | None) -> str:
+        if previous is None:
+            return "delta=--"
+        if not np.isfinite(current) or not np.isfinite(previous):
+            return "delta=n/a"
+        diff = float(current - previous)
+        if diff > 0.0:
+            return f"delta=+{abs(diff):.6e}"
+        if diff < 0.0:
+            return f"delta=-{abs(diff):.6e}"
+        return "delta=0.000000e+00"
+
+    def _callback(iteration: int, snapshot: Any) -> None:
+        nonlocal prev_loss
+        current_loss = float(getattr(snapshot, "batch_L_tilde", np.nan))
+        if not np.isfinite(current_loss):
+            current_loss = float(getattr(snapshot, "L_tilde", np.nan))
+
+        should_log = (
+            iteration == 1
+            or iteration == maxiter
+            or (iteration % log_every_iter == 0)
+        )
+        if should_log:
+            print(
+                f"    [seed={seed}] eval {iteration:>4}/{maxiter:<4} | "
+                f"objective={current_loss:.6e}, {_format_delta(current_loss, prev_loss)}",
+                flush=True,
+            )
+        prev_loss = current_loss
+
+    return _callback
+
+
+def _extract_vqbr_history(
+    seed: int,
+    history: Sequence[Any],
+) -> tuple[List[Dict[str, Any]], Dict[str, List[float]]]:
+    rows: List[Dict[str, Any]] = []
+    series: Dict[str, List[float]] = {
+        "objective_history": [],
+        "L_tilde_history": [],
+        "full_L_tilde_history": [],
+        "a_hat_history": [],
+        "c_hat_history": [],
+        "d_hat_history": [],
+        "e_hat_history": [],
+        "h_hat_history": [],
+    }
+    for iteration, snapshot in enumerate(history, start=1):
         batch_loss = float(getattr(snapshot, "batch_L_tilde", np.nan))
         if not np.isfinite(batch_loss):
             batch_loss = float(getattr(snapshot, "L_tilde", np.nan))
-        losses.append(batch_loss)
-    return losses
+        L_tilde = float(getattr(snapshot, "L_tilde", np.nan))
+        full_L_tilde = float(getattr(snapshot, "full_L_tilde", np.nan))
+        a_hat = float(getattr(snapshot, "a_hat", np.nan))
+        c_hat = float(getattr(snapshot, "c_hat", np.nan))
+        d_hat = float(getattr(snapshot, "d_hat", np.nan))
+        e_hat = float(getattr(snapshot, "e_hat", np.nan))
+        h_hat = float(getattr(snapshot, "h_hat", np.nan))
+        epoch = int(getattr(snapshot, "epoch", 0))
+        batch_position = int(getattr(snapshot, "batch_position", 0))
+        batch_indices = np.asarray(getattr(snapshot, "batch_indices", []), dtype=int).reshape(-1)
+        batch_size = int(batch_indices.size)
 
-
-def _reconstruct_vqbr_vector_from_state(
-    statevector: np.ndarray,
-    w_star: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    w_star = np.asarray(w_star, dtype=float).reshape(-1)
-    encoding_vector = _state_to_feature_direction(statevector, n_features=w_star.size)
-    if encoding_vector.shape[0] != w_star.shape[0]:
-        raise RuntimeError(
-            "Encoded feature direction length does not match closed-form solution length."
+        rows.append(
+            {
+                "seed": int(seed),
+                "objective_eval": int(iteration),
+                "batch_loss": float(batch_loss),
+                "L_tilde": float(L_tilde),
+                "full_L_tilde": float(full_L_tilde),
+                "a_hat": float(a_hat),
+                "c_hat": float(c_hat),
+                "d_hat": float(d_hat),
+                "e_hat": float(e_hat),
+                "h_hat": float(h_hat),
+                "epoch": int(epoch),
+                "batch_position": int(batch_position),
+                "batch_size": int(batch_size),
+            }
         )
-    # Quantum states are phase-invariant; align sign for fair vector comparison.
-    if float(np.dot(encoding_vector, w_star)) < 0.0:
-        encoding_vector = -encoding_vector
-    reconstructed_vector = float(np.linalg.norm(w_star)) * encoding_vector
-    return reconstructed_vector, encoding_vector
+        series["objective_history"].append(float(batch_loss))
+        series["L_tilde_history"].append(float(L_tilde))
+        series["full_L_tilde_history"].append(float(full_L_tilde))
+        series["a_hat_history"].append(float(a_hat))
+        series["c_hat_history"].append(float(c_hat))
+        series["d_hat_history"].append(float(d_hat))
+        series["e_hat_history"].append(float(e_hat))
+        series["h_hat_history"].append(float(h_hat))
+    return rows, series
 
 
-def _evaluate_vqbr_metrics(
+def _snapshot_objective(snapshot: Any) -> float:
+    objective_value = float(getattr(snapshot, "batch_L_tilde", np.nan))
+    if not np.isfinite(objective_value):
+        objective_value = float(getattr(snapshot, "L_tilde", np.nan))
+    return objective_value
+
+
+def _select_snapshot_for_solution(
+    history: Sequence[Any],
+    target_objective: float | None = None,
+) -> Any | None:
+    if not history:
+        return None
+    target = float(target_objective) if target_objective is not None else float("nan")
+    candidates: List[tuple[Any, float]] = []
+    for snapshot in history:
+        objective_value = _snapshot_objective(snapshot)
+        a_hat = float(getattr(snapshot, "a_hat", np.nan))
+        c_hat = float(getattr(snapshot, "c_hat", np.nan))
+        d_hat = float(getattr(snapshot, "d_hat", np.nan))
+        e_hat = float(getattr(snapshot, "e_hat", np.nan))
+        if (
+            np.isfinite(objective_value)
+            and np.isfinite(a_hat)
+            and np.isfinite(c_hat)
+            and np.isfinite(d_hat)
+            and np.isfinite(e_hat)
+        ):
+            candidates.append((snapshot, float(objective_value)))
+
+    if candidates:
+        if np.isfinite(target):
+            best_snapshot, _ = min(
+                candidates,
+                key=lambda item: abs(item[1] - target),
+            )
+            return best_snapshot
+        best_snapshot, _ = min(candidates, key=lambda item: item[1])
+        return best_snapshot
+
+    for snapshot in reversed(history):
+        a_hat = float(getattr(snapshot, "a_hat", np.nan))
+        c_hat = float(getattr(snapshot, "c_hat", np.nan))
+        d_hat = float(getattr(snapshot, "d_hat", np.nan))
+        e_hat = float(getattr(snapshot, "e_hat", np.nan))
+        if np.isfinite(a_hat) and np.isfinite(c_hat) and np.isfinite(d_hat) and np.isfinite(e_hat):
+            return snapshot
+    return None
+
+
+def _snapshot_at_final_theta(
+    vqbr_model: VariationalQuantumBayesianRegression,
+    n_samples: int,
+) -> Any | None:
+    """Evaluate objective terms at final optimizer parameters (result.x/theta_)."""
+    try:
+        theta = np.asarray(getattr(vqbr_model, "theta_"), dtype=float).reshape(-1)
+        batch_indices = np.arange(int(n_samples), dtype=int)
+        return vqbr_model._objective_on_batch(
+            theta,
+            batch_indices,
+            use_shot_noise=vqbr_model.use_shot_noise,
+            scale_batch_to_full=False,
+        )
+    except Exception:
+        return None
+
+
+def _reconstruct_weights_from_formula(
+    phi: np.ndarray,
+    final_snapshot: Any | None,
+) -> tuple[float, np.ndarray, Dict[str, float]]:
+    phi = np.asarray(phi, dtype=float).reshape(-1)
+    if final_snapshot is None:
+        terms = {
+            "a_hat": float("nan"),
+            "c_hat": float("nan"),
+            "d_hat": float("nan"),
+            "e_hat": float("nan"),
+            "numerator": float("nan"),
+            "denominator": float("nan"),
+        }
+        return float("nan"), np.full(phi.shape, np.nan, dtype=float), terms
+
+    a_hat = float(getattr(final_snapshot, "a_hat", np.nan))
+    c_hat = float(getattr(final_snapshot, "c_hat", np.nan))
+    d_hat = float(getattr(final_snapshot, "d_hat", np.nan))
+    e_hat = float(getattr(final_snapshot, "e_hat", np.nan))
+    numerator = float(c_hat + e_hat)
+    denominator = float(a_hat + d_hat)
+
+    if (
+        not np.isfinite(numerator)
+        or not np.isfinite(denominator)
+        or abs(denominator) <= EPS
+    ):
+        t_hat = float("nan")
+        w_hat = np.full(phi.shape, np.nan, dtype=float)
+    else:
+        t_hat = float(numerator / denominator)
+        w_hat = float(t_hat) * phi
+
+    terms = {
+        "a_hat": float(a_hat),
+        "c_hat": float(c_hat),
+        "d_hat": float(d_hat),
+        "e_hat": float(e_hat),
+        "numerator": float(numerator),
+        "denominator": float(denominator),
+    }
+    return t_hat, w_hat, terms
+
+
+def _evaluate_regression_metrics(
     *,
-    reconstructed_vector: np.ndarray,
-    encoding_vector: np.ndarray,
-    w_star: np.ndarray,
     X_train: np.ndarray,
-    y_train_raw: np.ndarray,
+    y_train: np.ndarray,
     X_test: np.ndarray,
-    y_test_raw: np.ndarray,
-    y_train_mean: float,
-    final_batch_L_hat: float,
-    batch_loss_history: List[float],
-) -> Dict[str, Any]:
-    y_train_pred = np.asarray(X_train, dtype=float) @ np.asarray(
-        reconstructed_vector, dtype=float
-    ) + float(y_train_mean)
-    y_test_pred = np.asarray(X_test, dtype=float) @ np.asarray(
-        reconstructed_vector, dtype=float
-    ) + float(y_train_mean)
-    w_star_arr = np.asarray(w_star, dtype=float)
-    reconstruction_arr = np.asarray(reconstructed_vector, dtype=float)
-    w_star_norm = float(np.linalg.norm(w_star_arr))
-    relative_l2_distance = float(
-        np.linalg.norm(reconstruction_arr - w_star_arr) / max(w_star_norm, EPS)
-    )
+    y_test: np.ndarray,
+    w: np.ndarray,
+) -> Dict[str, float]:
+    w = np.asarray(w, dtype=float).reshape(-1)
+    if w.size == 0 or not np.all(np.isfinite(w)):
+        return {
+            "train_rmse": float("nan"),
+            "test_rmse": float("nan"),
+            "train_r2": float("nan"),
+            "test_r2": float("nan"),
+        }
 
+    train_pred = np.asarray(X_train, dtype=float) @ w
+    test_pred = np.asarray(X_test, dtype=float) @ w
     return {
-        "cosine_similarity": _safe_cosine(reconstructed_vector, w_star),
-        "relative_l2_distance": relative_l2_distance,
-        "train_mse": _mse(y_train_raw, y_train_pred),
-        "test_mse": _mse(y_test_raw, y_test_pred),
-        "batch_L_hat": float(final_batch_L_hat),
-        "iterations": int(len(batch_loss_history)),
-        "batch_loss_history": [float(x) for x in batch_loss_history],
-        "loss_history": [float(x) for x in batch_loss_history],
-        "closed_form_norm": w_star_norm,
-        "encoding_vector": [float(x) for x in np.asarray(encoding_vector, dtype=float)],
-        "reconstructed_vector": [float(x) for x in np.asarray(reconstructed_vector, dtype=float)],
+        "train_rmse": _rmse(y_train, train_pred),
+        "test_rmse": _rmse(y_test, test_pred),
+        "train_r2": _r2_score(y_train, train_pred),
+        "test_r2": _r2_score(y_test, test_pred),
     }
 
 
-def _aggregate_case_results(
-    case_seed_results: List[Dict[str, Any]],
-) -> Dict[str, Dict[str, Dict[str, float]]]:
-    aggregate: Dict[str, Dict[str, Dict[str, float]]] = {}
+def _mean_std(values: Sequence[float]) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {"mean": float("nan"), "std": float("nan"), "n_valid": 0.0}
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr, ddof=0)),
+        "n_valid": float(arr.size),
+    }
 
-    methods_present = set()
-    for seed_result in case_seed_results:
-        methods_present.update(seed_result["methods"].keys())
 
-    for method in sorted(methods_present):
-        aggregate[method] = {}
-        for metric in METRIC_KEYS:
-            values: List[float] = []
-            for seed_result in case_seed_results:
-                method_metrics = seed_result["methods"].get(method, {})
-                if metric in method_metrics:
-                    values.append(float(method_metrics[metric]))
-            if not values:
-                continue
-            arr = np.asarray(values, dtype=float)
-            aggregate[method][metric] = {"mean": float(np.mean(arr)), "std": float(np.std(arr, ddof=0))}
+def _aggregate_results(per_seed_results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    aggregate: Dict[str, Any] = {
+        "vqbr": {},
+        "closed_form": {},
+        "runtime_seconds": {},
+        "iterations": {},
+    }
+
+    for metric_key in VQBR_METRIC_KEYS:
+        values = [
+            float(seed_result["methods"]["vqbr"].get(metric_key, np.nan))
+            for seed_result in per_seed_results
+        ]
+        aggregate["vqbr"][metric_key] = _mean_std(values)
+
+    for metric_key in CLOSED_FORM_METRIC_KEYS:
+        values = [
+            float(seed_result["methods"]["closed_form"].get(metric_key, np.nan))
+            for seed_result in per_seed_results
+        ]
+        aggregate["closed_form"][metric_key] = _mean_std(values)
+
+    for runtime_key in ("prior_estimation", "closed_form_fit", "vqbr_fit", "total"):
+        values = [
+            float(seed_result["runtime_seconds"].get(runtime_key, np.nan))
+            for seed_result in per_seed_results
+        ]
+        aggregate["runtime_seconds"][runtime_key] = _mean_std(values)
+
+    iteration_aggregate_keys = (
+        ("vqbr_objective_evaluations", "objective_evaluations"),
+        ("vqbr_optimizer_nfev", "optimizer_nfev"),
+        ("vqbr_optimizer_iterations", "optimizer_iterations"),
+    )
+    for aggregate_key, metric_key in iteration_aggregate_keys:
+        values = [
+            float(seed_result["methods"]["vqbr"].get(metric_key, np.nan))
+            for seed_result in per_seed_results
+        ]
+        aggregate["iterations"][aggregate_key] = _mean_std(values)
     return aggregate
 
 
-def _aggregate_overall(pair_results: Dict[str, Any]) -> Dict[str, Dict[str, Dict[str, float]]]:
-    collected: Dict[str, Dict[str, List[float]]] = {}
-    for pair_block in pair_results.values():
-        prior_cases = pair_block.get("prior_cases", {})
-        for prior_case in PRIOR_CASES:
-            prior_block = prior_cases.get(prior_case, {})
-            for seed_result in prior_block.get("per_seed", []):
-                methods = seed_result.get("methods", {})
-                for method, method_metrics in methods.items():
-                    if method not in collected:
-                        collected[method] = {metric: [] for metric in METRIC_KEYS}
-                    for metric in METRIC_KEYS:
-                        if metric in method_metrics:
-                            collected[method][metric].append(float(method_metrics[metric]))
-
-    overall: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for method, metric_values in collected.items():
-        overall[method] = {}
-        for metric, values in metric_values.items():
-            if not values:
-                continue
-            arr = np.asarray(values, dtype=float)
-            overall[method][metric] = {"mean": float(np.mean(arr)), "std": float(np.std(arr, ddof=0))}
-    return overall
+def _write_training_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "seed",
+        "objective_eval",
+        "batch_loss",
+        "L_tilde",
+        "full_L_tilde",
+        "a_hat",
+        "c_hat",
+        "d_hat",
+        "e_hat",
+        "h_hat",
+        "epoch",
+        "batch_position",
+        "batch_size",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
-def _resolve_vqbr_optimizer_configs(args: argparse.Namespace, n_train_samples: int) -> List[Dict[str, Any]]:
-    if n_train_samples <= 0:
-        raise ValueError("n_train_samples must be positive.")
-    if args.vqbr_batch_size <= 0:
-        raise ValueError("--vqbr-batch-size must be positive.")
+def _write_per_seed_metrics_csv(path: Path, per_seed_results: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "seed",
+        "method",
+        "cosine_similarity",
+        "feature_cosine_similarity",
+        "state_overlap_abs",
+        "train_rmse",
+        "test_rmse",
+        "train_r2",
+        "test_r2",
+        "t_hat",
+        "final_objective",
+        "objective_evaluations",
+        "optimizer_nfev",
+        "optimizer_iterations",
+        "runtime_seconds_method",
+        "runtime_seconds_seed_total",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for seed_result in per_seed_results:
+            seed = int(seed_result["seed"])
+            runtime_seed_total = float(seed_result["runtime_seconds"].get("total", np.nan))
+            runtime_vqbr = float(seed_result["runtime_seconds"].get("vqbr_fit", np.nan))
+            runtime_closed_form = float(seed_result["runtime_seconds"].get("closed_form_fit", np.nan))
 
-    selected_settings = _select_vqbr_optimizer_settings(args.vqbr_optimizer)
+            vqbr_metrics = dict(seed_result["methods"]["vqbr"])
+            writer.writerow(
+                {
+                    "seed": seed,
+                    "method": "vqbr",
+                    "cosine_similarity": float(vqbr_metrics.get("cosine_similarity", np.nan)),
+                    "feature_cosine_similarity": float(
+                        vqbr_metrics.get("feature_cosine_similarity", np.nan)
+                    ),
+                    "state_overlap_abs": float(vqbr_metrics.get("state_overlap_abs", np.nan)),
+                    "train_rmse": float(vqbr_metrics.get("train_rmse", np.nan)),
+                    "test_rmse": float(vqbr_metrics.get("test_rmse", np.nan)),
+                    "train_r2": float(vqbr_metrics.get("train_r2", np.nan)),
+                    "test_r2": float(vqbr_metrics.get("test_r2", np.nan)),
+                    "t_hat": float(vqbr_metrics.get("t_hat", np.nan)),
+                    "final_objective": float(vqbr_metrics.get("final_objective", np.nan)),
+                    "objective_evaluations": float(vqbr_metrics.get("objective_evaluations", np.nan)),
+                    "optimizer_nfev": float(vqbr_metrics.get("optimizer_nfev", np.nan)),
+                    "optimizer_iterations": float(vqbr_metrics.get("optimizer_iterations", np.nan)),
+                    "runtime_seconds_method": float(runtime_vqbr),
+                    "runtime_seconds_seed_total": float(runtime_seed_total),
+                }
+            )
 
-    configs: List[Dict[str, Any]] = []
-    for setting in selected_settings:
-        use_full_batch = bool(setting["use_full_batch"])
-        if use_full_batch:
-            batch_size_used = int(n_train_samples)
-            shuffle_batches = False
+            closed_form_metrics = dict(seed_result["methods"]["closed_form"])
+            writer.writerow(
+                {
+                    "seed": seed,
+                    "method": "closed_form",
+                    "cosine_similarity": float("nan"),
+                    "feature_cosine_similarity": float("nan"),
+                    "state_overlap_abs": float("nan"),
+                    "train_rmse": float(closed_form_metrics.get("train_rmse", np.nan)),
+                    "test_rmse": float(closed_form_metrics.get("test_rmse", np.nan)),
+                    "train_r2": float(closed_form_metrics.get("train_r2", np.nan)),
+                    "test_r2": float(closed_form_metrics.get("test_r2", np.nan)),
+                    "t_hat": float("nan"),
+                    "final_objective": float("nan"),
+                    "objective_evaluations": float("nan"),
+                    "optimizer_nfev": float("nan"),
+                    "optimizer_iterations": float("nan"),
+                    "runtime_seconds_method": float(runtime_closed_form),
+                    "runtime_seconds_seed_total": float(runtime_seed_total),
+                }
+            )
+
+
+def _write_summary_csv(path: Path, aggregate: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["category", "method", "metric", "mean", "std", "n_valid"]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for method in ("vqbr", "closed_form"):
+            for metric, stats in aggregate[method].items():
+                writer.writerow(
+                    {
+                        "category": "method_metric",
+                        "method": method,
+                        "metric": metric,
+                        "mean": float(stats.get("mean", np.nan)),
+                        "std": float(stats.get("std", np.nan)),
+                        "n_valid": int(stats.get("n_valid", 0.0)),
+                    }
+                )
+        for metric, stats in aggregate["runtime_seconds"].items():
+            writer.writerow(
+                {
+                    "category": "runtime_seconds",
+                    "method": "runtime",
+                    "metric": metric,
+                    "mean": float(stats.get("mean", np.nan)),
+                    "std": float(stats.get("std", np.nan)),
+                    "n_valid": int(stats.get("n_valid", 0.0)),
+                }
+            )
+        for metric, stats in aggregate["iterations"].items():
+            writer.writerow(
+                {
+                    "category": "iterations",
+                    "method": "vqbr",
+                    "metric": metric,
+                    "mean": float(stats.get("mean", np.nan)),
+                    "std": float(stats.get("std", np.nan)),
+                    "n_valid": int(stats.get("n_valid", 0.0)),
+                }
+            )
+
+
+def _format_mean_std(stats: Dict[str, float], *, scientific: bool) -> str:
+    mean = float(stats.get("mean", np.nan))
+    std = float(stats.get("std", np.nan))
+    if not np.isfinite(mean) or not np.isfinite(std):
+        return "nan +/- nan"
+    if scientific:
+        return f"{mean:.6e} +/- {std:.6e}"
+    return f"{mean:.6f} +/- {std:.6f}"
+
+
+def _slugify_token(raw: str) -> str:
+    out: List[str] = []
+    for ch in str(raw):
+        if ch.isalnum():
+            out.append(ch.lower())
+        elif ch in {"-", "_"}:
+            out.append(ch)
         else:
-            batch_size_used = int(min(int(args.vqbr_batch_size), n_train_samples))
-            shuffle_batches = bool(args.vqbr_shuffle_batches)
-        configs.append(
-            {
-                "method_key": str(setting["method_key"]),
-                "optimizer": str(setting["optimizer"]),
-                "batch_mode": str(setting["batch_mode"]),
-                "batch_size_used": int(batch_size_used),
-                "shuffle_batches": bool(shuffle_batches),
-            }
-        )
-    return configs
+            out.append("-")
+    slug = "".join(out).strip("-_")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return slug or "na"
 
 
-# ----------------------------
-# Fix A: global (V, lambda) per (pair, prior), estimated on pilot seeds
-# ----------------------------
-def _select_global_hyperparameters_for_pair(
+def _default_run_tag(
     *,
-    dataset_root: Path,
-    pair_name: str,
-    prior_case: str,
-    pilot_seeds: Sequence[int],
-    use_padded_features: bool,
-    V_grid: np.ndarray,
-    lambda_grid: np.ndarray,
-    prior_delta: float,
-    val_ratio_within_train: float,
-    log_realtime: bool,
-    log_hyperparam_sweep: bool,
-) -> Dict[str, float]:
-    # Accumulate validation MSEs across pilot seeds for each (V, lambda)
-    # key: (iV, iL) -> list of mses
-    store: Dict[Tuple[int, int], List[float]] = {}
-
-    model = ClosedFormMAPBayesianRegression()
-    for seed in pilot_seeds:
-        split = _load_pair_seed_split(
-            dataset_root=dataset_root,
-            pair_name=pair_name,
-            seed=int(seed),
-            use_padded_features=bool(use_padded_features),
-        )
-        X_train_raw = np.asarray(split["X_train"], dtype=float)
-        y_train_raw = np.asarray(split["y_train"], dtype=float).reshape(-1)
-
-        inner = _make_inner_split(
-            n_train_total=int(X_train_raw.shape[0]),
-            val_ratio_within_train=float(val_ratio_within_train),
-            seed=int(seed),
-        )
-        X_tune_train_raw = X_train_raw[inner.train_tune_indices]
-        y_tune_train_raw = y_train_raw[inner.train_tune_indices]
-        X_val_raw = X_train_raw[inner.val_indices]
-        y_val_raw = y_train_raw[inner.val_indices]
-
-        tune_mean, tune_std = _fit_feature_standardizer(X_tune_train_raw)
-        X_tune_train = _apply_feature_standardizer(X_tune_train_raw, tune_mean, tune_std)
-        X_val = _apply_feature_standardizer(X_val_raw, tune_mean, tune_std)
-        y_tune_mean, y_tune_train_centered = _fit_and_center_target(y_tune_train_raw)
-
-        for iV, V in enumerate(V_grid):
-            for iL, lambda_strength in enumerate(lambda_grid):
-                m0, sigma_diag = _build_prior(
-                    prior_case=prior_case,
-                    X_reference=X_tune_train,
-                    lambda_strength=float(lambda_strength),
-                    delta=float(prior_delta),
-                    variance_reference=X_tune_train_raw,
-                )
-                model.fit(
-                    X_tune_train,
-                    y_tune_train_centered,
-                    m0,
-                    sigma_diag,
-                    float(V),
-                )
-                y_val_pred_centered = model.predict(X_val)
-                y_val_pred = y_val_pred_centered + float(y_tune_mean)
-                val_mse = _mse(y_val_raw, y_val_pred)
-
-                store.setdefault((iV, iL), []).append(float(val_mse))
-
-                if log_hyperparam_sweep:
-                    print(
-                        "    "
-                        f"[{pair_name}][{prior_case}][pilot_seed={seed}] sweep: "
-                        f"V={float(V):.3e}, lambda={float(lambda_strength):.3e}, "
-                        f"val_mse={val_mse:.6f}",
-                        flush=True,
-                    )
-
-    best = {
-        "validation_mse_mean": float("inf"),
-        "validation_mse_std": float("nan"),
-        "V": float(V_grid[0]),
-        "lambda_strength": float(lambda_grid[0]),
-        "num_pilot_seeds": int(len(pilot_seeds)),
-        "pilot_seeds": [int(s) for s in pilot_seeds],
-    }
-
-    for (iV, iL), vals in store.items():
-        if not vals:
-            continue
-        arr = np.asarray(vals, dtype=float)
-        mean = float(np.mean(arr))
-        std = float(np.std(arr, ddof=0))
-        if mean < best["validation_mse_mean"]:
-            best = {
-                "validation_mse_mean": mean,
-                "validation_mse_std": std,
-                "V": float(V_grid[iV]),
-                "lambda_strength": float(lambda_grid[iL]),
-                "num_pilot_seeds": int(len(pilot_seeds)),
-                "pilot_seeds": [int(s) for s in pilot_seeds],
-            }
-
-    if log_realtime:
-        print(
-            "  "
-            f"[{pair_name}][{prior_case}] GLOBAL hyperparams selected (Fix A): "
-            f"V={best['V']:.3e}, lambda={best['lambda_strength']:.3e}, "
-            f"pilot_val_mse_mean={best['validation_mse_mean']:.6f}, "
-            f"pilot_val_mse_std={best['validation_mse_std']:.6f}, "
-            f"pilot_seeds={best['pilot_seeds']}",
-            flush=True,
-        )
-    return best
-
-
-def _run_one_seed_one_prior(
-    *,
-    pair_name: str,
-    seed: int,
-    prior_case: str,
-    X_train_raw: np.ndarray,
-    y_train_raw: np.ndarray,
-    X_test_raw: np.ndarray,
-    y_test_raw: np.ndarray,
-    fixed_V: float,
-    fixed_lambda_strength: float,
     args: argparse.Namespace,
-    split_meta: Dict[str, Any],
-    global_hyperparam_summary: Dict[str, Any],
-) -> Dict[str, Any]:
-    # Final train/test preprocessing with scaler fitted only on the outer train split.
-    train_mean, train_std = _fit_feature_standardizer(X_train_raw)
-    X_train = _apply_feature_standardizer(X_train_raw, train_mean, train_std)
-    X_test = _apply_feature_standardizer(X_test_raw, train_mean, train_std)
-    y_train_mean, y_train_centered = _fit_and_center_target(y_train_raw)
-
-    m0_train, sigma_diag_train = _build_prior(
-        prior_case=prior_case,
-        X_reference=X_train,
-        lambda_strength=float(fixed_lambda_strength),
-        delta=args.prior_delta,
-        variance_reference=X_train_raw,
+    seeds: Sequence[int],
+    optimizer: str,
+    loss: str,
+    use_shot_noise: bool,
+    su2_gates: Sequence[str],
+) -> str:
+    mode = "shot" if bool(use_shot_noise) else "analytic"
+    gates_tag = "-".join(_slugify_token(g) for g in su2_gates)
+    ent_tag = _slugify_token(str(args.vqbr_entanglement))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return (
+        f"synthetic_N{int(args.n_samples)}_D{int(args.n_features)}_"
+        f"seeds{int(len(seeds))}_maxiter{int(args.vqbr_maxiter)}_"
+        f"{str(optimizer).lower()}_{_slugify_token(loss)}_{mode}_"
+        f"reps{int(args.vqbr_reps)}_gates{gates_tag}_ent{ent_tag}_{timestamp}"
     )
-    V_selected = float(fixed_V)
 
-    # Closed-form MAP reference solution.
-    closed_form = ClosedFormMAPBayesianRegression()
-    closed_form.fit(X_train, y_train_centered, m0_train, sigma_diag_train, V_selected)
-    w_star = closed_form.get_weights()
 
-    methods: Dict[str, Dict[str, Any]] = {}
-    y_train_pred_closed_form = np.asarray(closed_form.predict(X_train), dtype=float) + float(y_train_mean)
-    y_test_pred_closed_form = np.asarray(closed_form.predict(X_test), dtype=float) + float(y_train_mean)
-    methods["closed_form"] = {
-        "train_mse": _mse(y_train_raw, y_train_pred_closed_form),
-        "test_mse": _mse(y_test_raw, y_test_pred_closed_form),
+def _to_filename(raw_path: str, fallback_name: str) -> str:
+    raw = str(raw_path).strip()
+    if not raw:
+        return str(fallback_name)
+    return Path(raw).name or str(fallback_name)
+
+
+def _resolve_run_paths(
+    *,
+    args: argparse.Namespace,
+    seeds: Sequence[int],
+    optimizer: str,
+    loss: str,
+    use_shot_noise: bool,
+    su2_gates: Sequence[str],
+) -> Dict[str, Any]:
+    cached = getattr(args, "_resolved_run_paths", None)
+    if isinstance(cached, dict) and cached:
+        return cached
+
+    run_tag = (
+        str(args.run_tag).strip()
+        if str(args.run_tag).strip()
+        else _default_run_tag(
+            args=args,
+            seeds=seeds,
+            optimizer=optimizer,
+            loss=loss,
+            use_shot_noise=use_shot_noise,
+            su2_gates=su2_gates,
+        )
+    )
+    run_dir = (
+        Path(str(args.run_dir).strip()).expanduser().resolve()
+        if str(args.run_dir).strip()
+        else Path(args.results_root).expanduser().resolve() / run_tag
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    results_name = _to_filename(args.output_path, "results.json")
+    training_name = _to_filename(args.training_csv_path, "training_log.csv")
+    per_seed_name = _to_filename(args.per_seed_csv_path, "per_seed_metrics.csv")
+    summary_name = _to_filename(args.summary_csv_path, "summary_metrics.csv")
+    run_config_name = _to_filename(args.run_config_path, "run_config.json")
+    console_log_name = (
+        _to_filename(args.console_log_path, "run.log")
+        if str(args.console_log_path).strip()
+        else ""
+    )
+    seed_artifacts_dir = run_dir / "seed_artifacts"
+    seed_artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved = {
+        "run_tag": str(run_tag),
+        "run_dir": str(run_dir),
+        "results_json": str(run_dir / results_name),
+        "training_csv": str(run_dir / training_name),
+        "per_seed_csv": str(run_dir / per_seed_name),
+        "summary_csv": str(run_dir / summary_name),
+        "run_config_json": str(run_dir / run_config_name),
+        "console_log": (str(run_dir / console_log_name) if console_log_name else ""),
+        "seed_artifacts_dir": str(seed_artifacts_dir),
     }
-    if args.log_realtime:
-        print(
-            "    "
-            f"[{pair_name}][{prior_case}][seed={seed}][closed_form] "
-            f"train_mse={methods['closed_form']['train_mse']:.6f}, "
-            f"test_mse={methods['closed_form']['test_mse']:.6f}",
-            flush=True,
-        )
 
-    vqbr_module = importlib.import_module("vqbr")
-    VariationalQuantumBayesianRegression = getattr(vqbr_module, "VariationalQuantumBayesianRegression")
-    optimizer_configs = _resolve_vqbr_optimizer_configs(args=args, n_train_samples=int(X_train.shape[0]))
-    vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
+    args.output_path = resolved["results_json"]
+    args.training_csv_path = resolved["training_csv"]
+    args.per_seed_csv_path = resolved["per_seed_csv"]
+    args.summary_csv_path = resolved["summary_csv"]
+    args.run_config_path = resolved["run_config_json"]
+    args.console_log_path = resolved["console_log"]
+    args.seed_artifacts_dir = resolved["seed_artifacts_dir"]
+    args.resolved_run_tag = str(run_tag)
+    args.resolved_run_dir = str(run_dir)
+    args._resolved_run_paths = resolved
+    return resolved
 
-    for opt_cfg in optimizer_configs:
-        method_key = str(opt_cfg["method_key"])
-        optimizer_name = str(opt_cfg["optimizer"])
-        batch_mode = str(opt_cfg["batch_mode"])
-        batch_size_used = int(opt_cfg["batch_size_used"])
-        shuffle_batches = bool(opt_cfg["shuffle_batches"])
 
-        if args.log_realtime:
-            print(
-                "    "
-                f"[{pair_name}][{prior_case}][seed={seed}][{method_key}] "
-                f"training start: optimizer={optimizer_name}, "
-                f"loss={vqbr_loss}, "
-                f"mode={batch_mode}, batch_size={batch_size_used}, "
-                f"shuffle_batches={shuffle_batches}",
-                flush=True,
-            )
+def load_seed_artifacts(npz_path: str | Path) -> Dict[str, np.ndarray]:
+    """Load a saved per-seed artifact .npz into a plain dict."""
+    path = Path(npz_path).expanduser().resolve()
+    with np.load(path, allow_pickle=False) as data:
+        return {key: np.array(data[key]) for key in data.files}
 
-        vqbr = VariationalQuantumBayesianRegression(
-            shots=args.vqbr_shots,
-            batch_size=batch_size_used,
-            reps=args.vqbr_reps,
-            optimizer=optimizer_name,
-            maxiter=args.vqbr_maxiter,
-            shuffle_batches=shuffle_batches,
-            learning_rate=args.vqbr_learning_rate,
-            loss=vqbr_loss,
-            random_state=seed,
-            use_shot_noise=args.vqbr_use_shot_noise,
-            verbose=args.vqbr_verbose,
-        )
-        iteration_callback = None
-        if args.log_realtime:
-            iteration_callback = _make_vqbr_iteration_logger(
-                prior_case=prior_case,
-                pair_name=pair_name,
-                seed=seed,
-                method_key=method_key,
-                optimizer=optimizer_name,
-                batch_mode=batch_mode,
-                batch_size=batch_size_used,
-                log_every_iter=args.log_every_iter,
-            )
 
-        fitted_state = vqbr.fit(
-            X_train,
-            y_train_centered,
-            m0_train,
-            sigma_diag_train,
-            V_selected,
-            iteration_callback=iteration_callback,
-        )
-
-        statevector = np.asarray(fitted_state, dtype=complex).reshape(-1)
-        state_norm = float(np.linalg.norm(statevector))
-        if state_norm <= EPS:
-            raise RuntimeError("VQBR fit returned a zero-norm state vector.")
-        statevector = statevector / state_norm
-
-        reconstructed_vector, encoding_vector = _reconstruct_vqbr_vector_from_state(statevector, w_star=w_star)
-        batch_loss_history = _collect_batch_loss_history(vqbr.history_)
-        finite_batch_losses = [x for x in batch_loss_history if np.isfinite(x)]
-        final_batch_L_hat = finite_batch_losses[-1] if finite_batch_losses else float("nan")
-        vqbr_metrics = _evaluate_vqbr_metrics(
-            reconstructed_vector=reconstructed_vector,
-            encoding_vector=encoding_vector,
-            w_star=w_star,
-            X_train=X_train,
-            y_train_raw=y_train_raw,
-            X_test=X_test,
-            y_test_raw=y_test_raw,
-            y_train_mean=y_train_mean,
-            final_batch_L_hat=final_batch_L_hat,
-            batch_loss_history=batch_loss_history,
-        )
-        vqbr_metrics["optimizer"] = optimizer_name
-        vqbr_metrics["batch_mode"] = batch_mode
-        vqbr_metrics["batch_size_used"] = int(batch_size_used)
-        vqbr_metrics["shuffle_batches"] = bool(shuffle_batches)
-        vqbr_metrics["loss"] = str(vqbr_loss)
-        methods[method_key] = vqbr_metrics
-
-        if args.log_realtime:
-            print(
-                "    "
-                f"[{pair_name}][{prior_case}][seed={seed}][{method_key}] "
-                f"cos={vqbr_metrics['cosine_similarity']:.6f}, "
-                f"rel_l2={vqbr_metrics['relative_l2_distance']:.6e}, "
-                f"train_mse={vqbr_metrics['train_mse']:.6f}, "
-                f"test_mse={vqbr_metrics['test_mse']:.6f}, "
-                f"batch_L_hat={vqbr_metrics['batch_L_hat']:.6e}",
-                flush=True,
-            )
-
-    n_train = int(X_train.shape[0])
-    n_test = int(X_test.shape[0])
-    train_ratio = split_meta.get("train_ratio")
-    test_ratio = split_meta.get("test_ratio")
-    if train_ratio is None or test_ratio is None:
-        total = float(n_train + n_test)
-        train_ratio = n_train / total
-        test_ratio = n_test / total
-
-    return {
-        "seed": int(seed),
-        "split": {
-            "n_train_total": n_train,
-            "n_test": n_test,
-            "train_ratio": float(train_ratio),
-            "test_ratio": float(test_ratio),
-            "val_ratio_within_train": float(args.val_ratio_within_train),
-        },
-        "preprocessing": {
-            "feature_standardization": {
-                "fitted_on": "outer_train_split",
-                "mean": [float(x) for x in train_mean],
-                "std": [float(x) for x in train_std],
-            },
-            "target_centering": {
-                "fitted_on": "outer_train_split",
-                "mean": float(y_train_mean),
-            },
-        },
-        "selected_hyperparameters": {
-            # Fix A: report the frozen hyperparams and how they were chosen.
-            "selection_mode": "global_frozen_per_pair",
-            "V": float(V_selected),
-            "lambda_strength": float(fixed_lambda_strength),
-            "prior_delta": float(args.prior_delta),
-            "pilot_selection": dict(global_hyperparam_summary),
-        },
-        "methods": methods,
-    }
+def _save_seed_artifacts(
+    *,
+    seed_artifact_path: Path,
+    seed: int,
+    split: SplitIndices,
+    X_prior: np.ndarray,
+    y_prior: np.ndarray,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    w_true: np.ndarray,
+    m0: np.ndarray,
+    Sigma0: np.ndarray,
+    V: float,
+    w_closed: np.ndarray,
+    phi: np.ndarray,
+    w_hat: np.ndarray,
+    t_hat: float,
+    theta_final: np.ndarray,
+    vqbr_state: np.ndarray,
+    objective_history: Sequence[float],
+    a_hat_history: Sequence[float],
+    c_hat_history: Sequence[float],
+    d_hat_history: Sequence[float],
+    e_hat_history: Sequence[float],
+    h_hat_history: Sequence[float],
+) -> None:
+    seed_artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        seed_artifact_path,
+        seed=np.asarray([int(seed)], dtype=np.int64),
+        split_prior_indices=np.asarray(split.prior_indices, dtype=np.int64),
+        split_train_indices=np.asarray(split.train_indices, dtype=np.int64),
+        split_test_indices=np.asarray(split.test_indices, dtype=np.int64),
+        X_prior=np.asarray(X_prior, dtype=float),
+        y_prior=np.asarray(y_prior, dtype=float),
+        X_train=np.asarray(X_train, dtype=float),
+        y_train=np.asarray(y_train, dtype=float),
+        X_test=np.asarray(X_test, dtype=float),
+        y_test=np.asarray(y_test, dtype=float),
+        w_true=np.asarray(w_true, dtype=float),
+        m0=np.asarray(m0, dtype=float),
+        Sigma0=np.asarray(Sigma0, dtype=float),
+        V=np.asarray([float(V)], dtype=float),
+        w_closed=np.asarray(w_closed, dtype=float),
+        phi=np.asarray(phi, dtype=float),
+        w_hat=np.asarray(w_hat, dtype=float),
+        t_hat=np.asarray([float(t_hat)], dtype=float),
+        theta_final=np.asarray(theta_final, dtype=float),
+        vqbr_state=np.asarray(vqbr_state, dtype=np.complex128),
+        objective_history=np.asarray(objective_history, dtype=float),
+        a_hat_history=np.asarray(a_hat_history, dtype=float),
+        c_hat_history=np.asarray(c_hat_history, dtype=float),
+        d_hat_history=np.asarray(d_hat_history, dtype=float),
+        e_hat_history=np.asarray(e_hat_history, dtype=float),
+        h_hat_history=np.asarray(h_hat_history, dtype=float),
+    )
 
 
 def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
-    dataset_root = Path(args.dataset_root).resolve()
-    output_path = Path(args.output_path).resolve()
+    if args.n_samples <= 0:
+        raise ValueError("--N/--n-samples must be positive.")
+    if args.n_features <= 0:
+        raise ValueError("--D/--n-features must be positive.")
+    if args.noise_std < 0.0:
+        raise ValueError("--noise-std must be non-negative.")
+    if args.w_true_std <= 0.0:
+        raise ValueError("--w-true-std must be positive.")
+    if args.vqbr_maxiter <= 0:
+        raise ValueError("--vqbr-maxiter must be positive.")
+    if args.vqbr_cobyla_tol <= 0.0:
+        raise ValueError("--vqbr-cobyla-tol must be positive.")
+    if args.vqbr_batch_size is not None and args.vqbr_batch_size <= 0:
+        raise ValueError("--vqbr-batch-size must be positive when provided.")
     if args.log_every_iter <= 0:
-        raise ValueError("--log-every-iter must be a positive integer.")
-    if args.vqbr_batch_size <= 0:
-        raise ValueError("--vqbr-batch-size must be a positive integer.")
-
-    manifest = _load_manifest(dataset_root)
-    pair_names = _resolve_pair_names(manifest, args.pairs, dataset_root)
-    manifest_seeds = manifest.get("seeds", [])
-    if not isinstance(manifest_seeds, list):
-        manifest_seeds = []
+        raise ValueError("--log-every-iter must be positive.")
 
     seeds = _resolve_seeds(
+        num_seeds=int(args.num_seeds),
+        seed_offset=int(args.seed_offset),
         explicit_seeds=args.seeds,
-        num_seeds=args.num_seeds,
-        seed_offset=args.seed_offset,
-        manifest_seeds=[int(x) for x in manifest_seeds],
     )
 
-    V_grid = _parse_float_grid(args.V_grid)
-    lambda_grid = _parse_float_grid(args.lambda_grid)
-    vqbr_loss = _normalize_vqbr_loss(args.vqbr_loss)
-    selected_optimizer_settings = _select_vqbr_optimizer_settings(args.vqbr_optimizer)
-    selected_method_keys = [str(setting["method_key"]) for setting in selected_optimizer_settings]
-    reported_method_keys = ["closed_form"] + selected_method_keys
-
-    pilot_k = int(args.hyperparam_pilot_seeds)
-    if pilot_k <= 0:
-        raise ValueError("--hyperparam-pilot-seeds must be positive.")
-    pilot_seeds = list(seeds[: min(pilot_k, len(seeds))])
-
-    result: Dict[str, Any] = {
-        "dataset": {
-            "root": str(dataset_root),
-            "source": "synthetic",
-            "pair_names": pair_names,
-            "num_pairs": int(len(pair_names)),
-        },
-        "config": {
-            "num_seeds": int(len(seeds)),
-            "seeds": [int(s) for s in seeds],
-            "prior_cases": list(PRIOR_CASES),
-            "val_ratio_within_train": float(args.val_ratio_within_train),
-            "V_grid": [float(x) for x in V_grid],
-            "lambda_grid": [float(x) for x in lambda_grid],
-            "prior_delta": float(args.prior_delta),
-            "methods": reported_method_keys,
-            "use_padded_features": bool(args.use_padded_features),
-            "vqbr": {
-                "shots": int(args.vqbr_shots),
-                "batch_size": int(args.vqbr_batch_size),
-                "reps": int(args.vqbr_reps),
-                "maxiter": int(args.vqbr_maxiter),
-                "shuffle_batches": bool(args.vqbr_shuffle_batches),
-                "learning_rate": float(args.vqbr_learning_rate),
-                "loss": str(vqbr_loss),
-                "use_shot_noise": bool(args.vqbr_use_shot_noise),
-            },
-            "hyperparam_selection": {
-                "mode": "FixA_global_frozen_per_pair",
-                "pilot_seeds": [int(s) for s in pilot_seeds],
-                "pilot_seeds_count": int(len(pilot_seeds)),
-            },
-            "logging": {
-                "realtime": bool(args.log_realtime),
-                "log_every_iter": int(args.log_every_iter),
-                "log_hyperparam_sweep": bool(args.log_hyperparam_sweep),
-            },
-        },
-        "pair_results": {},
-        "overall_aggregate": {},
-    }
-
-    print("=== Synthetic Experiment (Fix A: global frozen hyperparams per pair) ===")
-    print(f"Dataset root: {dataset_root}")
-    print(f"Pairs ({len(pair_names)}): {pair_names}")
-    print(f"Seeds ({len(seeds)}): {seeds}")
-    print(f"Pilot seeds for global (V,lambda): {pilot_seeds}")
-    print(f"Use padded features: {bool(args.use_padded_features)}")
-    print(f"Inner validation ratio (within train): {args.val_ratio_within_train:.2f}")
-    print("VQBR config:")
-    print(
-        "  "
-        f"shots={int(args.vqbr_shots)}, "
-        f"batch_size={int(args.vqbr_batch_size)}, "
-        f"reps={int(args.vqbr_reps)}, "
-        f"maxiter={int(args.vqbr_maxiter)}"
+    effective_optimizer = ENFORCED_VQBR_OPTIMIZER
+    effective_loss = ENFORCED_VQBR_LOSS
+    effective_use_shot_noise = bool(args.vqbr_use_shot_noise)
+    effective_su2_gates = ENFORCED_VQBR_SU2_GATES
+    run_paths = _resolve_run_paths(
+        args=args,
+        seeds=seeds,
+        optimizer=effective_optimizer,
+        loss=effective_loss,
+        use_shot_noise=effective_use_shot_noise,
+        su2_gates=effective_su2_gates,
     )
-    print("")
-
-    for pair_name in pair_names:
-        pair_meta = _manifest_pair_metadata(manifest, pair_name)
+    effective_loss_formula = (
+        LOG_RATIO_LOSS_FORMULA
+        if effective_loss == "log_ratio"
+        else "n/a"
+    )
+    if str(args.vqbr_loss).strip().lower() != effective_loss:
         print(
-            f"[Pair: {pair_name}] "
-            f"N={pair_meta.get('N')}, D={pair_meta.get('D')}, "
-            f"d={pair_meta.get('d')}, padded_dim={pair_meta.get('padded_dim')}"
+            f"Forcing VQBR loss to '{effective_loss}' (ignoring requested '{args.vqbr_loss}')."
+        )
+    print(
+        "Using objective evaluation mode: "
+        + ("finite-shot (shot noise enabled)." if effective_use_shot_noise else "analytic (no shot noise).")
+    )
+
+    print("=== Synthetic VQBR Experiment ===")
+    print(
+        f"N={int(args.n_samples)}, D={int(args.n_features)}, "
+        f"noise_std={float(args.noise_std):.6f}, w_true_std={float(args.w_true_std):.6f}"
+    )
+    print(
+        "Split ratios: "
+        f"prior={float(args.prior_ratio):.3f}, "
+        f"train={float(args.train_ratio):.3f}, "
+        f"test={float(args.test_ratio):.3f}"
+    )
+    print(f"Seeds ({len(seeds)}): {', '.join(str(s) for s in seeds)}")
+    print(
+        f"VQBR config: optimizer={effective_optimizer}, "
+        f"reps={int(args.vqbr_reps)}, su2_gates={effective_su2_gates}, "
+        f"entanglement={args.vqbr_entanglement}, "
+        f"maxiter={int(args.vqbr_maxiter)}, cobyla_tol={float(args.vqbr_cobyla_tol):.3e}, "
+        f"loss={effective_loss}, use_shot_noise={effective_use_shot_noise}"
+    )
+    print(f"VQBR loss formula: {effective_loss_formula}")
+    print(f"Run directory: {run_paths['run_dir']}")
+
+    training_rows: List[Dict[str, Any]] = []
+    per_seed_results: List[Dict[str, Any]] = []
+    seed_artifact_files: List[str] = []
+    experiment_start = time.perf_counter()
+    split_sizes_reference: Dict[str, int] | None = None
+
+    for seed_idx, seed in enumerate(seeds, start=1):
+        print("")
+        print(f"[seed={seed}] ({seed_idx}/{len(seeds)})", flush=True)
+        seed_start = time.perf_counter()
+
+        X, y, w_true = _generate_synthetic_data(
+            n_samples=int(args.n_samples),
+            n_features=int(args.n_features),
+            noise_std=float(args.noise_std),
+            w_true_std=float(args.w_true_std),
+            seed=int(seed),
+        )
+        split = _split_dataset_indices(
+            n_samples=int(args.n_samples),
+            prior_ratio=float(args.prior_ratio),
+            train_ratio=float(args.train_ratio),
+            test_ratio=float(args.test_ratio),
+            seed=int(seed),
         )
 
-        pair_block: Dict[str, Any] = {"pair": pair_meta, "prior_cases": {}}
+        X_prior = X[split.prior_indices]
+        y_prior = y[split.prior_indices]
+        X_train = X[split.train_indices]
+        y_train = y[split.train_indices]
+        X_test = X[split.test_indices]
+        y_test = y[split.test_indices]
 
-        for prior_case in PRIOR_CASES:
-            print(f"  [Prior case: {prior_case}]")
-
-            # Fix A: select once, reuse for all seeds for this (pair, prior)
-            global_hp = _select_global_hyperparameters_for_pair(
-                dataset_root=dataset_root,
-                pair_name=pair_name,
-                prior_case=prior_case,
-                pilot_seeds=pilot_seeds,
-                use_padded_features=bool(args.use_padded_features),
-                V_grid=V_grid,
-                lambda_grid=lambda_grid,
-                prior_delta=float(args.prior_delta),
-                val_ratio_within_train=float(args.val_ratio_within_train),
-                log_realtime=bool(args.log_realtime),
-                log_hyperparam_sweep=bool(args.log_hyperparam_sweep),
-            )
-            fixed_V = float(global_hp["V"])
-            fixed_lambda = float(global_hp["lambda_strength"])
-
-            case_seed_results: List[Dict[str, Any]] = []
-            for i, seed in enumerate(seeds, start=1):
-                print(f"    Seed {seed} ({i}/{len(seeds)})", flush=True)
-                split = _load_pair_seed_split(
-                    dataset_root=dataset_root,
-                    pair_name=pair_name,
-                    seed=seed,
-                    use_padded_features=bool(args.use_padded_features),
-                )
-
-                seed_result = _run_one_seed_one_prior(
-                    pair_name=pair_name,
-                    seed=seed,
-                    prior_case=prior_case,
-                    X_train_raw=np.asarray(split["X_train"], dtype=float),
-                    y_train_raw=np.asarray(split["y_train"], dtype=float).reshape(-1),
-                    X_test_raw=np.asarray(split["X_test"], dtype=float),
-                    y_test_raw=np.asarray(split["y_test"], dtype=float).reshape(-1),
-                    fixed_V=fixed_V,
-                    fixed_lambda_strength=fixed_lambda,
-                    args=args,
-                    split_meta=dict(split.get("split_meta", {})),
-                    global_hyperparam_summary=global_hp,
-                )
-                seed_result["data_files"] = {"seed_dir": str(split["seed_dir"])}
-                case_seed_results.append(seed_result)
-
-            pair_block["prior_cases"][prior_case] = {
-                "per_seed": case_seed_results,
-                "aggregate": _aggregate_case_results(case_seed_results),
-                "global_hyperparameters": dict(global_hp),
+        if split_sizes_reference is None:
+            split_sizes_reference = {
+                "prior": int(X_prior.shape[0]),
+                "train": int(X_train.shape[0]),
+                "test": int(X_test.shape[0]),
             }
-            print("")
 
-        result["pair_results"][pair_name] = pair_block
+        prior_start = time.perf_counter()
+        m0, Sigma0, V, prior_info = _estimate_prior_from_prior_split(
+            X_prior,
+            y_prior,
+            seed=int(seed),
+            bootstrap_samples=int(args.prior_bootstrap_samples),
+            ridge=float(args.prior_ridge),
+            sigma_floor=float(args.prior_sigma_floor),
+            v_floor=float(args.V_floor),
+        )
+        prior_runtime = float(time.perf_counter() - prior_start)
+        print(
+            f"  prior estimate: V={float(V):.6e}, "
+            f"prior_fit_mse={float(prior_info['prior_fit_mse']):.6e}, "
+            f"mean_sigma0_diag={float(prior_info['mean_sigma0_diag']):.6e}"
+        )
 
-    result["overall_aggregate"] = _aggregate_overall(result["pair_results"])
+        closed_form_start = time.perf_counter()
+        closed_form_model = ClosedFormMAPBayesianRegression()
+        closed_form_model.fit(X_train, y_train, m0, Sigma0, V)
+        w_closed = np.asarray(closed_form_model.get_weights(), dtype=float).reshape(-1)
+        closed_form_runtime = float(time.perf_counter() - closed_form_start)
+        closed_form_metrics = _evaluate_regression_metrics(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            w=w_closed,
+        )
+        print(
+            "  closed-form: "
+            f"train_rmse={closed_form_metrics['train_rmse']:.6e}, "
+            f"test_rmse={closed_form_metrics['test_rmse']:.6e}, "
+            f"train_R2={closed_form_metrics['train_r2']:.6f}, "
+            f"test_R2={closed_form_metrics['test_r2']:.6f}"
+        )
+
+        batch_size = int(args.vqbr_batch_size) if args.vqbr_batch_size is not None else int(X_train.shape[0])
+        batch_size = min(max(batch_size, 1), int(X_train.shape[0]))
+        vqbr = VariationalQuantumBayesianRegression(
+            shots=int(args.vqbr_shots),
+            batch_size=batch_size,
+            reps=int(args.vqbr_reps),
+            optimizer=effective_optimizer,
+            maxiter=int(args.vqbr_maxiter),
+            cobyla_tol=float(args.vqbr_cobyla_tol),
+            su2_gates=effective_su2_gates,
+            entanglement=str(args.vqbr_entanglement),
+            loss=effective_loss,
+            random_state=int(seed),
+            use_shot_noise=effective_use_shot_noise,
+            verbose=bool(args.vqbr_verbose),
+        )
+
+        callback = None
+        if bool(args.log_training):
+            callback = _build_training_logger(
+                seed=int(seed),
+                maxiter=int(args.vqbr_maxiter),
+                log_every_iter=int(args.log_every_iter),
+            )
+
+        vqbr_start = time.perf_counter()
+        vqbr_state = np.asarray(
+            vqbr.fit(
+                X_train,
+                y_train,
+                m0,
+                Sigma0,
+                V,
+                iteration_callback=callback,
+            ),
+            dtype=complex,
+        ).reshape(-1)
+        vqbr_runtime = float(time.perf_counter() - vqbr_start)
+        vqbr_state = _normalize_state(vqbr_state)
+
+        history_rows, history_series = _extract_vqbr_history(int(seed), vqbr.history_)
+        training_rows.extend(history_rows)
+        result_fun = float(getattr(vqbr.result_, "fun", np.nan))
+        final_snapshot = _snapshot_at_final_theta(vqbr, n_samples=int(X_train.shape[0]))
+        if final_snapshot is None:
+            final_snapshot = _select_snapshot_for_solution(vqbr.history_, target_objective=result_fun)
+
+        phi_from_overlaps = _feature_direction_from_final_overlaps(vqbr, X_train)
+        if phi_from_overlaps is not None:
+            phi = phi_from_overlaps
+            phi_source = "overlap_lstsq"
+        else:
+            phi = _state_to_feature_direction(vqbr_state, n_features=int(args.n_features))
+            phi_source = "statevector_phase_gauge"
+        t_hat, w_hat, reconstruction_terms = _reconstruct_weights_from_formula(phi, final_snapshot)
+        vqbr_regression_metrics = _evaluate_regression_metrics(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            w=w_hat,
+        )
+
+        w_closed_norm = float(np.linalg.norm(w_closed))
+        w_closed_unit = (
+            np.asarray(w_closed, dtype=float) / w_closed_norm
+            if w_closed_norm > EPS
+            else np.zeros_like(w_closed, dtype=float)
+        )
+        # Feature-direction cosine can differ by a global sign that is later absorbed by t_hat.
+        # Use reconstructed-weight cosine as the primary signed similarity metric.
+        feature_cosine_similarity = _safe_cosine(phi, w_closed_unit)
+        cosine_similarity = _safe_cosine(w_hat, w_closed)
+        closed_form_state = _normalized_closed_form_state(w_closed)
+        state_overlap_abs = float(np.abs(np.vdot(closed_form_state, vqbr_state)))
+
+        objective_history = history_series["objective_history"]
+        finite_objectives = [x for x in objective_history if np.isfinite(x)]
+        if np.isfinite(result_fun):
+            final_objective = float(result_fun)
+        elif finite_objectives:
+            final_objective = float(np.min(finite_objectives))
+        else:
+            final_objective = float("nan")
+
+        optimizer_nfev_raw = getattr(vqbr.result_, "nfev", np.nan)
+        try:
+            optimizer_nfev = float(optimizer_nfev_raw)
+        except Exception:
+            optimizer_nfev = float("nan")
+
+        optimizer_iterations_raw = getattr(vqbr.result_, "nit", np.nan)
+        try:
+            optimizer_iterations = float(optimizer_iterations_raw)
+        except Exception:
+            optimizer_iterations = float("nan")
+        theta_final = np.asarray(
+            getattr(vqbr, "theta_", getattr(vqbr.result_, "x", np.array([], dtype=float))),
+            dtype=float,
+        ).reshape(-1)
+
+        vqbr_metrics = {
+            "cosine_similarity": float(cosine_similarity),
+            "feature_cosine_similarity": float(feature_cosine_similarity),
+            "state_overlap_abs": float(state_overlap_abs),
+            "train_rmse": float(vqbr_regression_metrics["train_rmse"]),
+            "test_rmse": float(vqbr_regression_metrics["test_rmse"]),
+            "train_r2": float(vqbr_regression_metrics["train_r2"]),
+            "test_r2": float(vqbr_regression_metrics["test_r2"]),
+            "t_hat": float(t_hat),
+            "final_objective": float(final_objective),
+            "objective_evaluations": int(len(objective_history)),
+            "optimizer_nfev": float(optimizer_nfev),
+            "optimizer_iterations": float(optimizer_iterations),
+            "reconstruction_terms": reconstruction_terms,
+            "objective_history": [float(x) for x in objective_history],
+            "a_hat_history": [float(x) for x in history_series["a_hat_history"]],
+            "c_hat_history": [float(x) for x in history_series["c_hat_history"]],
+            "d_hat_history": [float(x) for x in history_series["d_hat_history"]],
+            "e_hat_history": [float(x) for x in history_series["e_hat_history"]],
+            "h_hat_history": [float(x) for x in history_series["h_hat_history"]],
+            "optimizer_success": bool(getattr(vqbr.result_, "success", False)),
+            "optimizer_message": str(getattr(vqbr.result_, "message", "")),
+            "simulator_backend": str(getattr(vqbr, "simulator_backend_", "")),
+            "simulator_device": str(getattr(vqbr, "simulator_device_", "")),
+            "feature_direction_source": str(phi_source),
+        }
+
+        seed_artifact_path = Path(args.seed_artifacts_dir).expanduser().resolve() / f"seed_{int(seed):04d}.npz"
+        _save_seed_artifacts(
+            seed_artifact_path=seed_artifact_path,
+            seed=int(seed),
+            split=split,
+            X_prior=X_prior,
+            y_prior=y_prior,
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            w_true=w_true,
+            m0=m0,
+            Sigma0=Sigma0,
+            V=V,
+            w_closed=w_closed,
+            phi=phi,
+            w_hat=w_hat,
+            t_hat=t_hat,
+            theta_final=theta_final,
+            vqbr_state=vqbr_state,
+            objective_history=objective_history,
+            a_hat_history=history_series["a_hat_history"],
+            c_hat_history=history_series["c_hat_history"],
+            d_hat_history=history_series["d_hat_history"],
+            e_hat_history=history_series["e_hat_history"],
+            h_hat_history=history_series["h_hat_history"],
+        )
+        seed_artifact_files.append(str(seed_artifact_path))
+        print(
+            "  vqbr: "
+            f"cos={vqbr_metrics['cosine_similarity']:.6f}, "
+            f"feature_cos={vqbr_metrics['feature_cosine_similarity']:.6f}, "
+            f"train_rmse={vqbr_metrics['train_rmse']:.6e}, "
+            f"test_rmse={vqbr_metrics['test_rmse']:.6e}, "
+            f"train_R2={vqbr_metrics['train_r2']:.6f}, "
+            f"test_R2={vqbr_metrics['test_r2']:.6f}, "
+            f"t_hat={vqbr_metrics['t_hat']:.6e}"
+        )
+
+        seed_runtime = float(time.perf_counter() - seed_start)
+        runtime_info = {
+            "prior_estimation": float(prior_runtime),
+            "closed_form_fit": float(closed_form_runtime),
+            "vqbr_fit": float(vqbr_runtime),
+            "total": float(seed_runtime),
+        }
+        print(
+            "  runtime (s): "
+            f"prior={runtime_info['prior_estimation']:.3f}, "
+            f"closed_form={runtime_info['closed_form_fit']:.3f}, "
+            f"vqbr_fit={runtime_info['vqbr_fit']:.3f}, "
+            f"total={runtime_info['total']:.3f}"
+        )
+
+        per_seed_results.append(
+            {
+                "seed": int(seed),
+                "dataset": {
+                    "n_samples": int(args.n_samples),
+                    "n_features": int(args.n_features),
+                    "noise_std": float(args.noise_std),
+                    "w_true_std": float(args.w_true_std),
+                    "w_true_norm": float(np.linalg.norm(w_true)),
+                },
+                "split_sizes": {
+                    "prior": int(X_prior.shape[0]),
+                    "train": int(X_train.shape[0]),
+                    "test": int(X_test.shape[0]),
+                },
+                "prior_estimate": {
+                    "V": float(V),
+                    "m0_norm": float(np.linalg.norm(m0)),
+                    "mean_sigma0_diag": float(np.mean(np.diag(Sigma0))),
+                    "prior_fit_mse": float(prior_info["prior_fit_mse"]),
+                    "bootstrap_samples": int(args.prior_bootstrap_samples),
+                    "ridge": float(args.prior_ridge),
+                    "sigma_floor": float(args.prior_sigma_floor),
+                    "v_floor": float(args.V_floor),
+                },
+                "runtime_seconds": runtime_info,
+                "artifacts": {
+                    "seed_npz_path": str(seed_artifact_path),
+                },
+                "methods": {
+                    "closed_form": {
+                        "train_rmse": float(closed_form_metrics["train_rmse"]),
+                        "test_rmse": float(closed_form_metrics["test_rmse"]),
+                        "train_r2": float(closed_form_metrics["train_r2"]),
+                        "test_r2": float(closed_form_metrics["test_r2"]),
+                    },
+                    "vqbr": vqbr_metrics,
+                },
+            }
+        )
+
+    aggregate = _aggregate_results(per_seed_results)
+    total_runtime = float(time.perf_counter() - experiment_start)
+
+    print("")
+    print("=== Aggregate Results (mean +/- std over seeds) ===")
+    print(
+        "VQBR state cosine:      "
+        f"{_format_mean_std(aggregate['vqbr']['cosine_similarity'], scientific=False)}"
+    )
+    print(
+        "VQBR feature cosine:    "
+        f"{_format_mean_std(aggregate['vqbr']['feature_cosine_similarity'], scientific=False)}"
+    )
+    print(f"VQBR train RMSE:        {_format_mean_std(aggregate['vqbr']['train_rmse'], scientific=True)}")
+    print(f"VQBR test RMSE:         {_format_mean_std(aggregate['vqbr']['test_rmse'], scientific=True)}")
+    print(f"VQBR train R^2:         {_format_mean_std(aggregate['vqbr']['train_r2'], scientific=False)}")
+    print(f"VQBR test R^2:          {_format_mean_std(aggregate['vqbr']['test_r2'], scientific=False)}")
+    print(f"Closed-form train RMSE: {_format_mean_std(aggregate['closed_form']['train_rmse'], scientific=True)}")
+    print(f"Closed-form test RMSE:  {_format_mean_std(aggregate['closed_form']['test_rmse'], scientific=True)}")
+    print(f"Closed-form train R^2:  {_format_mean_std(aggregate['closed_form']['train_r2'], scientific=False)}")
+    print(f"Closed-form test R^2:   {_format_mean_std(aggregate['closed_form']['test_r2'], scientific=False)}")
+    print(
+        "VQBR fit runtime (s):   "
+        f"{_format_mean_std(aggregate['runtime_seconds']['vqbr_fit'], scientific=True)}"
+    )
+    print(f"Total wall-clock runtime: {total_runtime:.3f} s")
+
+    output_path = Path(args.output_path).expanduser().resolve()
+    training_csv_path = Path(args.training_csv_path).expanduser().resolve()
+    per_seed_csv_path = Path(args.per_seed_csv_path).expanduser().resolve()
+    summary_csv_path = Path(args.summary_csv_path).expanduser().resolve()
+    run_config_path = Path(args.run_config_path).expanduser().resolve()
+    seed_artifacts_dir = Path(args.seed_artifacts_dir).expanduser().resolve()
+    seed_manifest_path = seed_artifacts_dir / "seed_artifacts_manifest.json"
+
+    _write_training_csv(training_csv_path, training_rows)
+    _write_per_seed_metrics_csv(per_seed_csv_path, per_seed_results)
+    _write_summary_csv(summary_csv_path, aggregate)
+    with seed_manifest_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "run_tag": str(getattr(args, "resolved_run_tag", "")),
+                "seed_artifacts_dir": str(seed_artifacts_dir),
+                "seed_artifact_files": [str(path) for path in seed_artifact_files],
+            },
+            f,
+            indent=int(args.json_indent),
+        )
+
+    payload: Dict[str, Any] = {
+        "run_utc": datetime.now(timezone.utc).isoformat(),
+        "run_tag": str(getattr(args, "resolved_run_tag", "")),
+        "run_dir": str(getattr(args, "resolved_run_dir", "")),
+        "config": {
+            "n_samples": int(args.n_samples),
+            "n_features": int(args.n_features),
+            "noise_std": float(args.noise_std),
+            "w_true_std": float(args.w_true_std),
+            "split_ratios": {
+                "prior": float(args.prior_ratio),
+                "train": float(args.train_ratio),
+                "test": float(args.test_ratio),
+            },
+            "seeds": [int(seed) for seed in seeds],
+            "num_seeds": int(len(seeds)),
+            "seed_mode": "explicit_list" if args.seeds is not None else "offset_range",
+            "prior_estimation": {
+                "bootstrap_samples": int(args.prior_bootstrap_samples),
+                "ridge": float(args.prior_ridge),
+                "sigma_floor": float(args.prior_sigma_floor),
+                "v_floor": float(args.V_floor),
+            },
+            "vqbr": {
+                "ansatz": "EfficientSU2",
+                "optimizer": effective_optimizer,
+                "reps": int(args.vqbr_reps),
+                "su2_gates": [str(g) for g in effective_su2_gates],
+                "entanglement": str(args.vqbr_entanglement),
+                "maxiter": int(args.vqbr_maxiter),
+                "cobyla_tol": float(args.vqbr_cobyla_tol),
+                "batch_size": (
+                    None
+                    if args.vqbr_batch_size is None
+                    else int(args.vqbr_batch_size)
+                ),
+                "shots": int(args.vqbr_shots),
+                "use_shot_noise": effective_use_shot_noise,
+                "loss": effective_loss,
+                "loss_formula": effective_loss_formula,
+            },
+        },
+        "split_sizes": split_sizes_reference if split_sizes_reference is not None else {},
+        "per_seed": per_seed_results,
+        "aggregate": aggregate,
+        "runtime_seconds_total": float(total_runtime),
+        "artifacts": {
+            "run_dir": str(getattr(args, "resolved_run_dir", "")),
+            "run_config_path": str(run_config_path),
+            "training_csv_path": str(training_csv_path),
+            "per_seed_csv_path": str(per_seed_csv_path),
+            "summary_csv_path": str(summary_csv_path),
+            "seed_artifacts_dir": str(seed_artifacts_dir),
+            "seed_artifacts_manifest_path": str(seed_manifest_path),
+            "seed_artifact_files": [str(path) for path in seed_artifact_files],
+        },
+    }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
-        json.dump(result, f, indent=args.json_indent)
+        json.dump(payload, f, indent=int(args.json_indent))
 
-    print(f"Saved results to: {output_path}")
-    return result
+    run_config_payload: Dict[str, Any] = {
+        "saved_utc": datetime.now(timezone.utc).isoformat(),
+        "command": " ".join(shlex.quote(token) for token in sys.argv),
+        "args": dict(vars(args)),
+        "resolved": {
+            "seeds": [int(seed) for seed in seeds],
+            "num_seeds": int(len(seeds)),
+            "seed_mode": "explicit_list" if args.seeds is not None else "offset_range",
+            "split_ratios": {
+                "prior": float(args.prior_ratio),
+                "train": float(args.train_ratio),
+                "test": float(args.test_ratio),
+            },
+            "split_sizes": split_sizes_reference if split_sizes_reference is not None else {},
+            "prior_estimation": payload["config"]["prior_estimation"],
+            "vqbr": payload["config"]["vqbr"],
+            "outputs": {
+                "results_json": str(output_path),
+                "run_config_json": str(run_config_path),
+                "training_csv": str(training_csv_path),
+                "per_seed_csv": str(per_seed_csv_path),
+                "summary_csv": str(summary_csv_path),
+                "console_log": str(args.console_log_path).strip(),
+                "seed_artifacts_dir": str(seed_artifacts_dir),
+                "seed_artifacts_manifest": str(seed_manifest_path),
+            },
+        },
+    }
+    run_config_path.parent.mkdir(parents=True, exist_ok=True)
+    with run_config_path.open("w", encoding="utf-8") as f:
+        json.dump(run_config_payload, f, indent=int(args.json_indent))
+
+    print(f"Saved JSON results to:    {output_path}")
+    print(f"Saved run config JSON:    {run_config_path}")
+    print(f"Saved training logs CSV:  {training_csv_path}")
+    print(f"Saved per-seed metrics:   {per_seed_csv_path}")
+    print(f"Saved aggregate summary:  {summary_csv_path}")
+    print(f"Saved seed artifacts:     {seed_artifacts_dir}")
+    print(f"Saved seed manifest:      {seed_manifest_path}")
+    return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run closed-form and VQBR on generated synthetic datasets over (N, D) pairs "
-            "with per-seed train/test splits. Fix A: globally freeze (V,lambda) per pair."
+            "Synthetic VQBR experiment (N=200, D=32 by default) with prior/train/test split 0.2/0.6/0.2. "
+            "Runs closed-form MAP and VQBR over multiple seeds and stores full VQBR training logs."
         )
     )
+    parser.add_argument("--N", "--n-samples", dest="n_samples", type=int, default=200)
+    parser.add_argument("--D", "--n-features", dest="n_features", type=int, default=16)
+    parser.add_argument("--noise-std", type=float, default=0.1)
+    parser.add_argument("--w-true-std", type=float, default=1.0)
+
+    parser.add_argument("--prior-ratio", type=float, default=0.2)
+    parser.add_argument("--train-ratio", type=float, default=0.6)
+    parser.add_argument("--test-ratio", type=float, default=0.2)
+
+    parser.add_argument("--num-seeds", type=int, default=20)
+    parser.add_argument("--seed-offset", type=int, default=0)
     parser.add_argument(
-        "--dataset-root",
-        type=str,
-        default=str(ROOT_DIR / "data" / "synthetic" / "generated"),
-        help="Root directory produced by data/synthetic/data_synthetic.py",
-    )
-    parser.add_argument(
-        "--pairs",
+        "--seeds",
         type=str,
         default=None,
-        help="Optional comma-separated subset of pair names (e.g., N16_D8,N80_D16).",
-    )
-    parser.add_argument("--use-padded-features", action="store_true")
-    parser.add_argument("--use-raw-features", dest="use_padded_features", action="store_false")
-    parser.set_defaults(use_padded_features=True)
-
-    parser.add_argument("--val-ratio-within-train", type=float, default=0.1)
-    parser.add_argument("--num-seeds", type=int, default=None)
-    parser.add_argument("--seed-offset", type=int, default=0)
-    parser.add_argument("--seeds", type=str, default=None)
-
-    parser.add_argument("--V-grid", type=str, default="1e-4,1e-3,1e-2,1e-1,1,10")
-    parser.add_argument("--lambda-grid", type=str, default="1e-4,1e-3,1e-2,1e-1,1,10,100")
-    parser.add_argument("--prior-delta", type=float, default=1e-8)
-
-    # Fix A: how many seeds to use for pilot hyperparam selection
-    parser.add_argument(
-        "--hyperparam-pilot-seeds",
-        type=int,
-        default=3,
-        help="Number of earliest seeds used to pick a global (V,lambda) per pair (Fix A).",
+        help="Optional comma-separated explicit seed list. Overrides --num-seeds/--seed-offset.",
     )
 
-    parser.add_argument("--vqbr-shots", type=int, default=1024)
-    parser.add_argument("--vqbr-batch-size", type=int, default=100)
-    parser.add_argument("--vqbr-reps", type=int, default=4)
-    parser.add_argument(
-        "--vqbr-optimizer",
-        "--vqbr-optimizers",
-        dest="vqbr_optimizer",
-        type=str,
-        default="COBYLA",
-        help="Comma-separated VQBR optimizers to run. Supported: COBYLA.",
-    )
+    parser.add_argument("--prior-bootstrap-samples", type=int, default=64)
+    parser.add_argument("--prior-ridge", type=float, default=1e-6)
+    parser.add_argument("--prior-sigma-floor", type=float, default=1e-4)
+    parser.add_argument("--V-floor", type=float, default=1e-8)
+
+    parser.add_argument("--vqbr-reps", type=int, default=2)
+    parser.add_argument("--vqbr-entanglement", type=str, default="linear")
     parser.add_argument("--vqbr-maxiter", type=int, default=400)
-    parser.add_argument("--vqbr-shuffle-batches", action="store_true")
-    parser.add_argument("--no-vqbr-shuffle-batches", dest="vqbr_shuffle_batches", action="store_false")
-    parser.set_defaults(vqbr_shuffle_batches=True)
-    parser.add_argument("--vqbr-learning-rate", type=float, default=0.05)
-    parser.add_argument("--vqbr-loss", type=str, default="neg_ratio")
-    parser.add_argument("--vqbr-use-shot-noise", action="store_true")
-    parser.add_argument("--no-vqbr-shot-noise", dest="vqbr_use_shot_noise", action="store_false")
-    parser.set_defaults(vqbr_use_shot_noise=True)
+    parser.add_argument("--vqbr-cobyla-tol", type=float, default=1e-8)
+    parser.add_argument(
+        "--vqbr-batch-size",
+        type=int,
+        default=None,
+        help="Batch size used by VQBR. Default uses full training batch.",
+    )
+    parser.add_argument("--vqbr-shots", type=int, default=2048)
+    parser.add_argument("--vqbr-loss", type=str, default="log_ratio")
     parser.add_argument("--vqbr-verbose", action="store_true")
 
-    parser.add_argument("--log-realtime", action="store_true")
-    parser.add_argument("--no-log-realtime", dest="log_realtime", action="store_false")
-    parser.set_defaults(log_realtime=True)
-    parser.add_argument("--log-every-iter", type=int, default=5)
-    parser.add_argument("--log-hyperparam-sweep", action="store_true")
+    parser.add_argument("--vqbr-use-shot-noise", dest="vqbr_use_shot_noise", action="store_true")
+    parser.add_argument("--vqbr-no-shot-noise", dest="vqbr_use_shot_noise", action="store_false")
+    parser.set_defaults(vqbr_use_shot_noise=False)
+
+    parser.set_defaults(log_training=True)
+    parser.add_argument("--log-training", action="store_true")
+    parser.add_argument("--no-log-training", dest="log_training", action="store_false")
+    parser.add_argument("--log-every-iter", type=int, default=1)
+    parser.add_argument(
+        "--results-root",
+        type=str,
+        default=str(DEFAULT_RESULTS_ROOT),
+        help=(
+            "Root directory for auto-organized runs. "
+            "Each run is saved under <results-root>/<run-tag>/."
+        ),
+    )
+    parser.add_argument(
+        "--run-tag",
+        type=str,
+        default="",
+        help="Optional run folder name. If omitted, a config-based tag is generated automatically.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        type=str,
+        default="",
+        help="Optional explicit run directory. Overrides --results-root/--run-tag when set.",
+    )
 
     parser.add_argument(
         "--output-path",
         type=str,
-        default=str(ROOT_DIR / "results" / "synthetic" / "synthetic_experiment_results.json"),
+        default="results.json",
+        help="Results JSON filename (saved inside the run directory).",
+    )
+    parser.add_argument(
+        "--training-csv-path",
+        type=str,
+        default="training_log.csv",
+        help="Training CSV filename (saved inside the run directory).",
+    )
+    parser.add_argument(
+        "--per-seed-csv-path",
+        type=str,
+        default="per_seed_metrics.csv",
+        help="Per-seed CSV filename (saved inside the run directory).",
+    )
+    parser.add_argument(
+        "--summary-csv-path",
+        type=str,
+        default="summary_metrics.csv",
+        help="Summary CSV filename (saved inside the run directory).",
+    )
+    parser.add_argument(
+        "--run-config-path",
+        type=str,
+        default="run_config.json",
+        help="Run-config JSON filename (saved inside the run directory).",
     )
     parser.add_argument(
         "--console-log-path",
         type=str,
-        default=str(ROOT_DIR / "results" / "synthetic" / "synthetic_experiment_run.log"),
-        help="Path to mirror all console output. Set empty string to disable file logging.",
+        default="run.log",
+        help=(
+            "Console log filename (saved inside the run directory). "
+            "Set empty string to disable file logging."
+        ),
     )
     parser.add_argument("--json-indent", type=int, default=2)
     return parser
 
 
+class _TeeStream:
+    """Mirror writes to multiple stream-like objects."""
+
+    def __init__(self, *streams: object):
+        self._streams = streams
+
+    def write(self, data: str) -> int:
+        for stream in self._streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    seeds = _resolve_seeds(
+        num_seeds=int(args.num_seeds),
+        seed_offset=int(args.seed_offset),
+        explicit_seeds=args.seeds,
+    )
+    _resolve_run_paths(
+        args=args,
+        seeds=seeds,
+        optimizer=ENFORCED_VQBR_OPTIMIZER,
+        loss=ENFORCED_VQBR_LOSS,
+        use_shot_noise=bool(args.vqbr_use_shot_noise),
+        su2_gates=ENFORCED_VQBR_SU2_GATES,
+    )
     console_log_raw = str(args.console_log_path).strip()
     if not console_log_raw:
         run_experiment(args)

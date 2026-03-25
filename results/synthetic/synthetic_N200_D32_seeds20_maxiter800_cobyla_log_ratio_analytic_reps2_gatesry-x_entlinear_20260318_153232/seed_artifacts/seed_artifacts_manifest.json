@@ -1,0 +1,26 @@
+{
+  "run_tag": "synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232",
+  "seed_artifacts_dir": "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts",
+  "seed_artifact_files": [
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0000.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0001.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0002.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0003.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0004.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0005.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0006.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0007.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0008.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0009.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0010.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0011.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0012.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0013.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0014.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0015.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0016.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0017.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0018.npz",
+    "/work/tiennv/VQBR/results/synthetic/synthetic_N200_D32_seeds20_maxiter800_cobyla_log_ratio_analytic_reps2_gatesry-x_entlinear_20260318_153232/seed_artifacts/seed_0019.npz"
+  ]
+}

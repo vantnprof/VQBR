@@ -7,9 +7,9 @@ import numpy as np
 from scipy.optimize import OptimizeResult, minimize
 
 try:
-    from qiskit import QuantumCircuit
+    from qiskit import QuantumCircuit, transpile
     from qiskit.circuit.library import StatePreparation
-    from qiskit.quantum_info import Statevector
+    from qiskit.quantum_info import Operator, SparsePauliOp, Statevector
     try:
         from qiskit_aer import AerSimulator
     except Exception:
@@ -27,7 +27,10 @@ try:
 
 except Exception as exc:  # pragma: no cover - import guard for optional dependency
     QuantumCircuit = None  # type: ignore[assignment]
+    transpile = None  # type: ignore[assignment]
     StatePreparation = None  # type: ignore[assignment]
+    Operator = None  # type: ignore[assignment]
+    SparsePauliOp = None  # type: ignore[assignment]
     Statevector = None  # type: ignore[assignment]
     AerSimulator = None  # type: ignore[assignment]
     EfficientSU2 = None  # type: ignore[assignment]
@@ -57,13 +60,14 @@ class VariationalQuantumBayesianRegression:
     Notes:
     - `Sigma0` can be provided as a 1D diagonal vector or a full SPD covariance matrix.
       The precision `Sigma_0^{-1}` is computed classically.
-    - For dense (non-diagonal) `Sigma0`, `d_hat` is evaluated from the simulated
-      statevector exactly; shot-noise sampling is only applied in the diagonal case.
+    - For dense (non-diagonal) `Sigma0`, `d_hat` supports:
+      - deterministic mode (`use_shot_noise=False`): exact statevector quadratic form
+      - stochastic mode (`use_shot_noise=True`): Pauli-term measurement estimates
     - `fit` returns the trained statevector amplitudes prepared by the optimized ansatz.
     - If `qiskit-aer` is installed and a GPU device is available, training uses
       `AerSimulator(method="statevector", device="GPU")` automatically.
     - `loss` controls the scalar objective form:
-      - `log_ratio` (default): log(a_hat + d_hat) - 2 * log(|c_hat + e_hat|).
+      - `log_ratio` (default): log(a_hat + d_hat + eps) - log((c_hat + e_hat)^2 + eps).
       - `neg_ratio`: -((c_hat + e_hat)^2 / (a_hat + d_hat)).
     - `simulator_device_`, `simulator_backend_`, and `simulator_reason_` report
       which statevector backend was selected (and why).
@@ -76,6 +80,7 @@ class VariationalQuantumBayesianRegression:
         reps: int = 1,
         optimizer: str = "COBYLA",
         maxiter: int = 100,
+        cobyla_tol: float = 1e-2,
         epochs: Optional[int] = None,
         shuffle_batches: bool = True,
         learning_rate: Optional[float] = None,
@@ -97,6 +102,7 @@ class VariationalQuantumBayesianRegression:
         self.reps = int(reps)
         self.optimizer = self._normalize_optimizer(optimizer)
         self.maxiter = int(maxiter)
+        self.cobyla_tol = float(cobyla_tol)
         self.epochs = epochs
         self.shuffle_batches = bool(shuffle_batches)
         self.learning_rate = None if learning_rate is None else float(learning_rate)
@@ -126,12 +132,17 @@ class VariationalQuantumBayesianRegression:
         self.simulator_backend_: str = "statevector_cpu"
         self.simulator_reason_: str = "Using CPU statevector simulator."
         self._statevector_backend: Optional[Any] = None
+        self._sampling_backend: Optional[Any] = None
         self._precision_matrix: Optional[np.ndarray] = None
         self._precision_is_diagonal: bool = True
         self._warned_dense_d_hat_shot_noise: bool = False
+        self._dense_operator_padded: Optional[np.ndarray] = None
+        self._dense_pauli_terms: Optional[List[tuple[str, complex]]] = None
 
         if self.learning_rate is not None and self.learning_rate <= 0.0:
             raise ValueError("learning_rate must be strictly positive when provided.")
+        if self.cobyla_tol <= 0.0:
+            raise ValueError("cobyla_tol must be strictly positive.")
 
     def fit(
         self,
@@ -175,6 +186,7 @@ class VariationalQuantumBayesianRegression:
         self._y = y
         self._V = V
         self._configure_statevector_backend()
+        self._configure_sampling_backend()
         self._log_backend_selection()
 
         precision = self._precision_from_covariance(Sigma0)
@@ -185,6 +197,25 @@ class VariationalQuantumBayesianRegression:
         off_diag = precision - np.diag(precision_diag)
         self._precision_is_diagonal = bool(np.allclose(off_diag, 0.0, atol=1e-12))
         self._precision_diag_padded = self._pad_to_pow2(precision_diag)
+        self._dense_operator_padded = None
+        self._dense_pauli_terms = None
+
+        if not self._precision_is_diagonal:
+            dense_operator = np.zeros((state_dim, state_dim), dtype=complex)
+            dense_operator[:n_features, :n_features] = self._V * precision
+            self._dense_operator_padded = dense_operator
+            if self.use_shot_noise:
+                if Operator is None or SparsePauliOp is None:
+                    raise ImportError(
+                        "Dense precision shot-noise mode requires qiskit.quantum_info "
+                        "Operator and SparsePauliOp support."
+                    )
+                dense_pauli = SparsePauliOp.from_operator(Operator(dense_operator)).simplify(atol=1e-12)
+                dense_pauli_terms: List[tuple[str, complex]] = []
+                for label, coeff in zip(dense_pauli.paulis.to_labels(), dense_pauli.coeffs):
+                    if abs(coeff) > 1e-12:
+                        dense_pauli_terms.append((label, complex(coeff)))
+                self._dense_pauli_terms = dense_pauli_terms
 
         self._row_norms = np.linalg.norm(X, axis=1)
         if np.any(self._row_norms <= 0.0):
@@ -381,8 +412,9 @@ class VariationalQuantumBayesianRegression:
 
     def _compute_objective_value(self, numerator: float, denom: float) -> float:
         if self.loss == "log_ratio":
-            # Stability transform that is monotonic-equivalent to maximizing numerator^2 / denom.
-            return float(np.log(denom) - 2.0 * np.log(np.abs(numerator) + self.eps))
+            # Log-ratio objective used by experiments:
+            # log(denom) - log(numerator^2 + eps).
+            return float(np.log(denom) - np.log((numerator * numerator) + self.eps))
         # Direct objective: minimize the negative ratio.
         return float(-((numerator * numerator) / denom))
 
@@ -509,7 +541,10 @@ class VariationalQuantumBayesianRegression:
             )
             return float(full_snap.L_tilde)
 
-        options: Dict[str, Any] = {"maxiter": self.maxiter}
+        options: Dict[str, Any] = {
+            "maxiter": self.maxiter,
+            "tol": self.cobyla_tol,
+        }
         if self.optimizer == "SPSA":
             # In SPSA mode we still solve with SciPy COBYLA; use learning_rate as
             # the initial trust-region radius so it controls update aggressiveness.
@@ -522,7 +557,6 @@ class VariationalQuantumBayesianRegression:
             x0=theta_init,
             method=scipy_method,
             options=options,
-            tol=1e-12,
         )
 
     def _append_snapshot(
@@ -739,6 +773,34 @@ class VariationalQuantumBayesianRegression:
             sv = Statevector.from_instruction(qc)
             return np.asarray(sv.data, dtype=complex)
 
+    def _configure_sampling_backend(self) -> None:
+        self._sampling_backend = None
+        if not self.use_shot_noise:
+            return
+        if AerSimulator is None:
+            raise RuntimeError("qiskit-aer is required for use_shot_noise=True.")
+        if transpile is None:
+            raise ImportError("qiskit transpile support is required for use_shot_noise=True.")
+        self._sampling_backend = AerSimulator()
+
+    def _run_shot_counts(self, qc: QuantumCircuit) -> tuple[Dict[str, int], int]:
+        if self._sampling_backend is None:
+            raise RuntimeError("Sampling backend is unavailable. Ensure use_shot_noise=True and fit() called.")
+        if transpile is None:
+            raise ImportError("qiskit transpile support is required for shot-based estimators.")
+
+        qc_meas = qc.copy()
+        qc_meas.measure_all()
+        compiled = transpile(qc_meas, self._sampling_backend, optimization_level=0)
+        result = self._sampling_backend.run(compiled, shots=self.shots).result()
+        counts = result.get_counts(compiled)
+        if isinstance(counts, list):
+            counts = counts[0]
+        total = int(sum(counts.values()))
+        if total <= 0:
+            raise RuntimeError("No counts returned from sampler backend.")
+        return counts, total
+
     def _theta_bind(self, theta_vec: np.ndarray) -> Dict[Any, float]:
         theta_vec = np.asarray(theta_vec, dtype=float).reshape(-1)
         if theta_vec.shape[0] != self._num_params:
@@ -771,14 +833,17 @@ class VariationalQuantumBayesianRegression:
         use_shot_noise: Optional[bool] = None,
     ) -> float:
         qc = self._build_overlap_circuit(Uv_gate, theta_vec)
-        state = self._simulate_statevector(qc)
-        p0 = float(np.sum(np.abs(state[0::2]) ** 2))
-        p0 = float(np.clip(p0, 0.0, 1.0))
-
         apply_shot_noise = self.use_shot_noise if use_shot_noise is None else bool(use_shot_noise)
         if apply_shot_noise:
-            n0 = self._rng.binomial(self.shots, p0)
-            p0 = n0 / float(self.shots)
+            counts, total = self._run_shot_counts(qc)
+            # Bitstring order is c[n-1]...c[0], so ancilla q0 is rightmost bit.
+            n0 = sum(cnt for bitstr, cnt in counts.items() if bitstr[-1] == "0")
+            p0 = float(n0) / float(total)
+        else:
+            state = self._simulate_statevector(qc)
+            # Qubit-0 (ancilla) is least-significant in statevector indexing.
+            p0 = float(np.sum(np.abs(state[0::2]) ** 2))
+            p0 = float(np.clip(p0, 0.0, 1.0))
 
         s_hat = 2.0 * p0 - 1.0
         return float(np.clip(s_hat, -1.0, 1.0))
@@ -790,36 +855,65 @@ class VariationalQuantumBayesianRegression:
         bound_ansatz = self._ansatz.assign_parameters(self._theta_bind(theta_vec), inplace=False)
         qc.compose(bound_ansatz, inplace=True)
 
-        state = self._simulate_statevector(qc)
         apply_shot_noise = self.use_shot_noise if use_shot_noise is None else bool(use_shot_noise)
         if self._precision_is_diagonal:
+            if apply_shot_noise:
+                counts, total = self._run_shot_counts(qc)
+                d_hat = 0.0
+                for bitstr, cnt in counts.items():
+                    basis_index = int(bitstr, 2)
+                    d_hat += float(self._precision_diag_padded[basis_index]) * float(cnt) / float(total)
+                return float(self._V * d_hat)
+
+            state = self._simulate_statevector(qc)
             probs = np.abs(state) ** 2
             probs = probs / np.sum(probs)
-            if apply_shot_noise:
-                counts = self._rng.multinomial(self.shots, probs)
-                # Includes V inside.
-                return float(
-                    self._V * np.dot(self._precision_diag_padded, counts) / float(self.shots)
-                )
-
             # Includes V inside.
             return float(self._V * np.dot(self._precision_diag_padded, probs))
 
-        precision = self._precision_matrix
-        if precision is None:
-            raise RuntimeError("Precision matrix is unavailable. Ensure fit() was called.")
+        dense_operator = self._dense_operator_padded
+        if dense_operator is None:
+            raise RuntimeError("Dense precision operator is unavailable. Ensure fit() was called.")
 
-        if apply_shot_noise and self.verbose and not self._warned_dense_d_hat_shot_noise:
-            print(
-                "Dense Sigma0 detected: d_hat is evaluated deterministically from the "
-                "statevector (shot-noise sampling is only used for diagonal precision)."
+        if not apply_shot_noise:
+            state = self._simulate_statevector(qc)
+            quad = float(np.real(np.vdot(state, dense_operator @ state)))
+            return float(quad)
+
+        dense_pauli_terms = self._dense_pauli_terms
+        if dense_pauli_terms is None:
+            raise RuntimeError(
+                "Dense precision shot-noise path requires Pauli decomposition terms."
             )
-            self._warned_dense_d_hat_shot_noise = True
 
-        state_features = np.asarray(state[: self._n_features], dtype=complex)
-        quad = float(np.real(np.vdot(state_features, precision @ state_features)))
-        quad = max(quad, 0.0)
-        return float(self._V * quad)
+        d_hat = 0.0
+        for label, coeff in dense_pauli_terms:
+            qc_term = QuantumCircuit(self._num_qubits)
+            qc_term.compose(bound_ansatz, inplace=True)
+
+            # Basis changes for Pauli measurement.
+            for q in range(self._num_qubits):
+                pauli_char = label[self._num_qubits - 1 - q]
+                if pauli_char == "X":
+                    qc_term.h(q)
+                elif pauli_char == "Y":
+                    qc_term.sdg(q)
+                    qc_term.h(q)
+
+            counts, total = self._run_shot_counts(qc_term)
+            mu_hat = 0.0
+            for bitstr, cnt in counts.items():
+                parity = 1.0
+                for q in range(self._num_qubits):
+                    pauli_char = label[self._num_qubits - 1 - q]
+                    if pauli_char == "I":
+                        continue
+                    if bitstr[-1 - q] == "1":
+                        parity *= -1.0
+                mu_hat += parity * float(cnt) / float(total)
+            d_hat += float(np.real(coeff)) * mu_hat
+
+        return float(d_hat)
 
     def _objective_on_batch(
         self,
