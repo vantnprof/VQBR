@@ -1,0 +1,5 @@
+method_key,method_label,status,cosine_similarity_to_classical
+classical,Classical solution,success,1.0
+vqbr_sim,VQBR (sim),success,0.9999995174619946
+vqbr_ibm_no_zne,"VQBR (aer_noise, w/o ZNE)",success,0.994897526062348
+vqbr_ibm_zne,"VQBR (aer_noise, w/ ZNE)",success,0.9958854648092438

@@ -1,0 +1,2 @@
+seed,method_key,method_label,backend_name,status,objective_eval,batch_loss,L_tilde,full_L_tilde,a_hat,c_hat,d_hat,e_hat,h_hat,epoch,batch_position,batch_size
+0,vqbr_sim,Statevector simulation,statevector_simulator,success,1,2.277290232681609,2.277290232681609,2.277290232681609,26.092511065937256,1.4402701888811102,0.3610798045586101,0.20688692159056393,0.10303223428065114,0,0,30

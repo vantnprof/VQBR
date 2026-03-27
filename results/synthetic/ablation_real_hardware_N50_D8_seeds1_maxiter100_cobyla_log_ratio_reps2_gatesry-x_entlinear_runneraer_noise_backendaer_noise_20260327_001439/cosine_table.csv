@@ -1,0 +1,5 @@
+method_key,method_label,status,cosine_similarity_to_classical
+classical,Classical solution,success,1.0
+vqbr_sim,Statevector simulation,success,0.9969702959537102
+vqbr_ibm_no_zne,Aer noise runner (w/o mitigation),success,0.9865738903472578
+vqbr_ibm_zne,Aer noise runner (w/ ZNE),success,0.9909899095235221

@@ -1,0 +1,155 @@
+{
+  "saved_utc": "2026-03-27T04:19:35.076034+00:00",
+  "command": "script/exp/ablation_shot_noise.py --num-seeds 20",
+  "args": {
+    "n_samples": 200,
+    "n_features": 8,
+    "noise_std": 0.1,
+    "w_true_std": 1.0,
+    "prior_ratio": 0.2,
+    "train_ratio": 0.6,
+    "test_ratio": 0.2,
+    "num_seeds": 20,
+    "seed_offset": 0,
+    "seeds": null,
+    "prior_bootstrap_samples": 64,
+    "prior_ridge": 1e-06,
+    "prior_sigma_floor": 0.0001,
+    "V_floor": 1e-08,
+    "include_analytic": true,
+    "shots_list": null,
+    "vqbr_reps": 2,
+    "vqbr_entanglement": "linear",
+    "vqbr_maxiter": 300,
+    "vqbr_cobyla_tol": 1e-08,
+    "vqbr_batch_size": null,
+    "vqbr_shots": 2048,
+    "vqbr_loss": "log_ratio",
+    "vqbr_verbose": false,
+    "log_training": true,
+    "log_every_iter": 1,
+    "results_root": "/work/tiennv/VQBR/results/synthetic",
+    "run_tag": "",
+    "run_dir": "",
+    "output_path": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/results.json",
+    "training_csv_path": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/training_log.csv",
+    "per_seed_csv_path": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/per_seed_metrics.csv",
+    "summary_csv_path": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/summary_metrics.csv",
+    "curve_summary_csv_path": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/curve_summary.csv",
+    "run_config_path": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/run_config.json",
+    "console_log_path": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/run.log",
+    "json_indent": 2,
+    "resolved_run_tag": "ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041",
+    "resolved_run_dir": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041",
+    "_resolved_run_paths": {
+      "run_tag": "ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041",
+      "run_dir": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041",
+      "results_json": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/results.json",
+      "training_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/training_log.csv",
+      "per_seed_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/per_seed_metrics.csv",
+      "summary_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/summary_metrics.csv",
+      "curve_summary_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/curve_summary.csv",
+      "run_config_json": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/run_config.json",
+      "console_log": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/run.log"
+    }
+  },
+  "resolved": {
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "num_seeds": 20,
+    "seed_mode": "offset_range",
+    "settings": [
+      {
+        "setting_label": "analytic",
+        "display_label": "analytic",
+        "is_analytic": true,
+        "shots": null
+      },
+      {
+        "setting_label": "shots_256",
+        "display_label": "256",
+        "is_analytic": false,
+        "shots": 256
+      },
+      {
+        "setting_label": "shots_1024",
+        "display_label": "1024",
+        "is_analytic": false,
+        "shots": 1024
+      },
+      {
+        "setting_label": "shots_4096",
+        "display_label": "4096",
+        "is_analytic": false,
+        "shots": 4096
+      },
+      {
+        "setting_label": "shots_16384",
+        "display_label": "16384",
+        "is_analytic": false,
+        "shots": 16384
+      }
+    ],
+    "split_ratios": {
+      "prior": 0.2,
+      "train": 0.6,
+      "test": 0.2
+    },
+    "split_sizes": {
+      "prior": 40,
+      "train": 120,
+      "test": 40
+    },
+    "prior_estimation": {
+      "bootstrap_samples": 64,
+      "ridge": 1e-06,
+      "sigma_floor": 0.0001,
+      "v_floor": 1e-08
+    },
+    "vqbr": {
+      "ansatz": "EfficientSU2",
+      "optimizer": "COBYLA",
+      "reps": 2,
+      "su2_gates": [
+        "ry",
+        "x"
+      ],
+      "entanglement": "linear",
+      "maxiter": 300,
+      "cobyla_tol": 1e-08,
+      "batch_size": null,
+      "analytic_placeholder_shots": 2048,
+      "loss": "log_ratio",
+      "loss_formula": "log(a_hat + d_hat + eps) - log((c_hat + e_hat)^2 + eps)"
+    },
+    "outputs": {
+      "results_json": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/results.json",
+      "run_config_json": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/run_config.json",
+      "training_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/training_log.csv",
+      "per_seed_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/per_seed_metrics.csv",
+      "summary_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/summary_metrics.csv",
+      "curve_summary_csv": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/curve_summary.csv",
+      "console_log": "/work/tiennv/VQBR/results/synthetic/ablation_shot_noise_N200_D8_seeds20_maxiter300_cobyla_log_ratio_analytic-shots256-shots1024-shots4096-shots16384_gatesry-x_entlinear_20260325_124041/run.log"
+    }
+  }
+}

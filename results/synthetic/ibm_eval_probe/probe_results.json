@@ -1,0 +1,202 @@
+{
+  "script": "/work/tiennv/VQBR/script/exp/ibm_hardware_eval_probe.py",
+  "timestamp_utc": "2026-03-27T05:59:20.238837+00:00",
+  "dataset": {
+    "n_samples": 50,
+    "n_features": 8,
+    "noise_std": 0.1,
+    "w_true_std": 1.0,
+    "prior_ratio": 0.2,
+    "train_ratio": 0.6,
+    "test_ratio": 0.2,
+    "seed": 0,
+    "train_size": 30,
+    "prior_size": 10
+  },
+  "ibm": {
+    "backend_name": "ibm_kingston",
+    "shots": 1024,
+    "transpile_optimization_level": 1,
+    "zne_noise_factors": [
+      1.0,
+      3.0,
+      5.0
+    ],
+    "zne_extrapolator": "linear",
+    "zne_measure_mitigation": false,
+    "resolved_info": {
+      "config_path": "/work/tiennv/VQBR/config/ibm_config.json",
+      "backend_name": "ibm_kingston",
+      "channel": "ibm_quantum_platform",
+      "instance": "crn:v1:bluemix:public:quantum-computing:us-east:a/9d14b4c30d2a4f7fb26617861ec3f2a3:adb4a5cb-5ab7-4bb8-93ea-22642f68eec1::",
+      "url": "",
+      "runtime_import_available": true,
+      "service_kwargs": {
+        "channel": "ibm_quantum_platform",
+        "instance": "crn:v1:bluemix:public:quantum-computing:us-east:a/9d14b4c30d2a4f7fb26617861ec3f2a3:adb4a5cb-5ab7-4bb8-93ea-22642f68eec1::",
+        "url": "",
+        "token_present": true
+      },
+      "raw_config_sanitized": {
+        "channel": "ibm_quantum_platform",
+        "instance": "crn:v1:bluemix:public:quantum-computing:us-east:a/9d14b4c30d2a4f7fb26617861ec3f2a3:adb4a5cb-5ab7-4bb8-93ea-22642f68eec1::",
+        "backend_name": "ibm_kingston",
+        "_config_path": "/work/tiennv/VQBR/config/ibm_config.json",
+        "token_present": true
+      }
+    },
+    "no_zne_estimator": {
+      "shots": 1024,
+      "use_zne": false,
+      "mitigation_label": "w/o ZNE",
+      "options": {
+        "default_shots": 1024,
+        "seed_estimator": 0,
+        "resilience_level": 0,
+        "resilience": {
+          "measure_mitigation": false,
+          "zne_mitigation": false
+        }
+      }
+    },
+    "zne_estimator": {
+      "shots": 1024,
+      "use_zne": true,
+      "mitigation_label": "w/ ZNE",
+      "options": {
+        "default_shots": 1024,
+        "seed_estimator": 0,
+        "resilience_level": 0,
+        "resilience": {
+          "measure_mitigation": false,
+          "zne_mitigation": true,
+          "zne": {
+            "amplifier": "gate_folding",
+            "noise_factors": [
+              1.0,
+              3.0,
+              5.0
+            ],
+            "extrapolator": "linear"
+          }
+        }
+      }
+    },
+    "zne_baseline_estimator": {
+      "shots": 1024,
+      "use_zne": false,
+      "mitigation_label": "w/o ZNE",
+      "options": {
+        "default_shots": 1024,
+        "seed_estimator": 0,
+        "resilience_level": 0,
+        "resilience": {
+          "measure_mitigation": false,
+          "zne_mitigation": false
+        }
+      }
+    }
+  },
+  "prior": {
+    "bootstrap_samples": 64.0,
+    "ridge": 1e-06,
+    "sigma_floor": 0.0001,
+    "v_floor": 1e-08,
+    "V": 0.06708953638047582,
+    "prior_fit_mse": 0.06708953638047582,
+    "mean_sigma0_diag": 0.13625813373756973
+  },
+  "vqbr": {
+    "optimizer": "COBYLA",
+    "loss": "log_ratio",
+    "reps": 2,
+    "entanglement": "linear",
+    "su2_gates": [
+      "ry",
+      "x"
+    ]
+  },
+  "measured": {
+    "one_time_setup_seconds": 4.649538662284613,
+    "objective_no_zne_seconds": 20.80181380175054,
+    "objective_zne_seconds": 53.942258417606354,
+    "objective_no_zne_pub_count": 32,
+    "objective_zne_hadamard_pub_count": 31,
+    "objective_zne_d_pub_count": 1,
+    "objective_no_zne_snapshot": {
+      "L_tilde": -0.4724305752098812,
+      "a_hat": 4.955130018210538,
+      "c_hat": 2.90254518534958,
+      "d_hat": 0.36879982165930336,
+      "e_hat": 0.019609203932766377
+    },
+    "objective_zne_snapshot": {
+      "L_tilde": 2.9588731642072754,
+      "a_hat": 7.655674201132013,
+      "c_hat": -0.7745050430324465,
+      "d_hat": 0.37025151164326087,
+      "e_hat": 0.12924254682653527
+    }
+  },
+  "estimated_maxiter": 100,
+  "estimated_runtime_seconds": {
+    "no_zne_branch_seconds": 2100.9831939768046,
+    "zne_branch_seconds": 5448.168100178242,
+    "hardware_total_seconds": 7549.151294155046,
+    "hardware_total_plus_setup_seconds": 7553.800832817331,
+    "objective_evaluations_per_branch": 101
+  },
+  "artifacts": {
+    "output_json": "/work/tiennv/VQBR/results/synthetic/ibm_eval_probe/probe_results.json",
+    "run_dir": "/work/tiennv/VQBR/results/synthetic/ibm_eval_probe"
+  },
+  "config": {
+    "argv": [
+      "script/exp/ibm_hardware_eval_probe.py",
+      "--ibm-config",
+      "config/ibm_config.json",
+      "--ibm-backend",
+      "ibm_kingston",
+      "--estimated-maxiter",
+      "100",
+      "--run-tag",
+      "ibm_eval_probe"
+    ],
+    "args": {
+      "n_samples": 50,
+      "n_features": 8,
+      "noise_std": 0.1,
+      "w_true_std": 1.0,
+      "prior_ratio": 0.2,
+      "train_ratio": 0.6,
+      "test_ratio": 0.2,
+      "num_seeds": 1,
+      "seed_offset": 0,
+      "seeds": "0",
+      "prior_bootstrap_samples": 64,
+      "prior_ridge": 1e-06,
+      "prior_sigma_floor": 0.0001,
+      "V_floor": 1e-08,
+      "vqbr_reps": 2,
+      "vqbr_entanglement": "linear",
+      "estimated_maxiter": 100,
+      "ibm_config": "config/ibm_config.json",
+      "ibm_backend": "ibm_kingston",
+      "ibm_channel": "",
+      "ibm_instance": "",
+      "ibm_url": "",
+      "ibm_token": "",
+      "ibm_shots": 1024,
+      "ibm_transpile_optimization_level": 1,
+      "zne_noise_factors": "1,3,5",
+      "zne_extrapolator": "linear",
+      "zne_measure_mitigation": false,
+      "component_breakdown": false,
+      "results_root": "/work/tiennv/VQBR/results/synthetic",
+      "run_tag": "ibm_eval_probe",
+      "run_dir": "",
+      "console_log_path": "run.log",
+      "_resolved_probe_run_dir": "/work/tiennv/VQBR/results/synthetic/ibm_eval_probe"
+    }
+  }
+}

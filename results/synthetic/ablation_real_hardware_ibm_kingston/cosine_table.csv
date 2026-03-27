@@ -1,0 +1,5 @@
+method_key,method_label,status,cosine_similarity_to_classical
+classical,Classical solution,success,1.0
+vqbr_sim,Statevector simulation,success,0.9956130497142335
+vqbr_ibm_no_zne,"IBM hardware (ibm_kingston, w/o mitigation)",success,0.8970808026439054
+vqbr_ibm_zne,"IBM hardware (ibm_kingston, w/ ZNE)",success,0.9477776044016111

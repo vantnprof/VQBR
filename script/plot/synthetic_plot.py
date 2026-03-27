@@ -35,8 +35,10 @@ def _load_histories_from_training_csv(training_csv_path: Path) -> Dict[int, List
     rows_by_seed: Dict[int, List[tuple[int, float]]] = {}
     with training_csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
-        required_columns = {"seed", "iteration", "batch_loss"}
-        missing = required_columns - set(reader.fieldnames or [])
+        fieldnames = set(reader.fieldnames or [])
+        iteration_key = "iteration" if "iteration" in fieldnames else "objective_eval"
+        required_columns = {"seed", "batch_loss", iteration_key}
+        missing = required_columns - fieldnames
         if missing:
             raise ValueError(
                 f"Training CSV is missing required columns: {sorted(missing)}. "
@@ -44,7 +46,7 @@ def _load_histories_from_training_csv(training_csv_path: Path) -> Dict[int, List
             )
         for row in reader:
             seed = int(row["seed"])
-            iteration = int(row["iteration"])
+            iteration = int(row[iteration_key])
             loss = float(row["batch_loss"])
             rows_by_seed.setdefault(seed, []).append((iteration, loss))
 
