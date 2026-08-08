@@ -19,12 +19,13 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 SRC_DIR = ROOT_DIR / "src"
 
 # Make local method modules importable when running from repo root.
-for module_dir in ("closed_form", "vqbr"):
+for module_dir in ("closed_form", "vqbr", "conjugate_gd"):
     module_path = SRC_DIR / module_dir
     if str(module_path) not in sys.path:
         sys.path.insert(0, str(module_path))
 
 from closed_form import ClosedFormMAPBayesianRegression  # noqa: E402
+from conjugate_gd import ConjugateGradientMAPBayesianRegression  # noqa: E402
 from vqbr import VariationalQuantumBayesianRegression  # noqa: E402
 
 
@@ -51,12 +52,26 @@ CLOSED_FORM_METRIC_KEYS = (
     "train_r2",
     "test_r2",
 )
+CG_METRIC_KEYS = (
+    "cosine_similarity",
+    "feature_cosine_similarity",
+    "state_overlap_abs",
+    "train_mse",
+    "test_mse",
+    "train_rmse",
+    "test_rmse",
+    "train_r2",
+    "test_r2",
+    "relative_residual",
+    "final_objective",
+)
 
 ENFORCED_VQBR_OPTIMIZER = "COBYLA"
 ENFORCED_VQBR_LOSS = "log_ratio"
 ENFORCED_VQBR_SU2_GATES: tuple[str, ...] = ("ry", "x")
 LOG_RATIO_LOSS_FORMULA = "log(a_hat + d_hat + eps) - log((c_hat + e_hat)^2 + eps)"
 DEFAULT_RESULTS_ROOT = ROOT_DIR / "results" / "energy"
+DEFAULT_CG_PRECONDITIONER = "none"
 
 
 @dataclass
@@ -984,6 +999,346 @@ def load_seed_artifacts(npz_path: str | Path) -> Dict[str, np.ndarray]:
         return {key: np.array(data[key]) for key in data.files}
 
 
+def _companion_filename(raw_path: str, default_name: str, legacy_default_name: str) -> str:
+    raw = str(raw_path).strip()
+    if not raw:
+        return str(default_name)
+    name = Path(raw).name or str(default_name)
+    if name == str(legacy_default_name):
+        return str(default_name)
+    return str(name)
+
+
+def _resolve_cg_run_paths(
+    *,
+    args: argparse.Namespace,
+    source_results_path: Path,
+    source_payload: Dict[str, Any],
+) -> Dict[str, str]:
+    cached = getattr(args, "_resolved_cg_run_paths", None)
+    if isinstance(cached, dict) and cached:
+        return cached
+
+    source_run_tag = str(source_payload.get("run_tag", "")).strip() or source_results_path.parent.name
+    run_tag = str(args.run_tag).strip() or str(source_run_tag)
+    run_dir = (
+        Path(str(args.run_dir).strip()).expanduser().resolve()
+        if str(args.run_dir).strip()
+        else (
+            Path(args.results_root).expanduser().resolve() / run_tag
+            if str(args.run_tag).strip()
+            else source_results_path.parent
+        )
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved = {
+        "run_tag": str(run_tag),
+        "run_dir": str(run_dir),
+        "results_json": str(
+            run_dir
+            / _companion_filename(
+                args.output_path,
+                "cg_results.json",
+                "results.json",
+            )
+        ),
+        "training_csv": str(
+            run_dir
+            / _companion_filename(
+                args.training_csv_path,
+                "cg_training_log.csv",
+                "training_log.csv",
+            )
+        ),
+        "per_seed_csv": str(
+            run_dir
+            / _companion_filename(
+                args.per_seed_csv_path,
+                "cg_per_seed_metrics.csv",
+                "per_seed_metrics.csv",
+            )
+        ),
+        "summary_csv": str(
+            run_dir
+            / _companion_filename(
+                args.summary_csv_path,
+                "cg_summary_metrics.csv",
+                "summary_metrics.csv",
+            )
+        ),
+        "run_config_json": str(
+            run_dir
+            / _companion_filename(
+                args.run_config_path,
+                "cg_run_config.json",
+                "run_config.json",
+            )
+        ),
+        "console_log": (
+            str(
+                run_dir
+                / _companion_filename(
+                    args.console_log_path,
+                    "cg_run.log",
+                    "run.log",
+                )
+            )
+            if str(args.console_log_path).strip()
+            else ""
+        ),
+    }
+
+    args.output_path = resolved["results_json"]
+    args.training_csv_path = resolved["training_csv"]
+    args.per_seed_csv_path = resolved["per_seed_csv"]
+    args.summary_csv_path = resolved["summary_csv"]
+    args.run_config_path = resolved["run_config_json"]
+    args.console_log_path = resolved["console_log"]
+    args.resolved_run_tag = str(run_tag)
+    args.resolved_run_dir = str(run_dir)
+    args._resolved_cg_run_paths = resolved
+    return resolved
+
+
+def _resolve_source_seed_artifact_files(
+    payload: Dict[str, Any],
+    source_results_path: Path,
+) -> List[Path]:
+    artifact_paths = payload.get("artifacts", {}).get("seed_artifact_files", [])
+    paths = [Path(p).expanduser().resolve() for p in artifact_paths if str(p).strip()]
+    if paths:
+        return paths
+
+    manifest_path_raw = payload.get("artifacts", {}).get("seed_artifacts_manifest_path", "")
+    if str(manifest_path_raw).strip():
+        manifest_path = Path(str(manifest_path_raw)).expanduser().resolve()
+        if manifest_path.exists():
+            with manifest_path.open("r", encoding="utf-8") as f:
+                manifest = json.load(f)
+            manifest_paths = manifest.get("seed_artifact_files", [])
+            paths = [Path(p).expanduser().resolve() for p in manifest_paths if str(p).strip()]
+            if paths:
+                return paths
+
+    seed_artifacts_dir_raw = payload.get("artifacts", {}).get("seed_artifacts_dir", "")
+    if str(seed_artifacts_dir_raw).strip():
+        seed_artifacts_dir = Path(str(seed_artifacts_dir_raw)).expanduser().resolve()
+    else:
+        seed_artifacts_dir = source_results_path.parent / "seed_artifacts"
+    return sorted(seed_artifacts_dir.glob("seed_*.npz"))
+
+
+def _reduced_objective_from_weights(
+    system_matrix: np.ndarray,
+    rhs: np.ndarray,
+    weights: np.ndarray,
+    eps: float = EPS,
+) -> float:
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if weights.size == 0 or not np.all(np.isfinite(weights)):
+        return float("nan")
+
+    norm = float(np.linalg.norm(weights))
+    if norm <= eps:
+        return float("nan")
+
+    phi = weights / norm
+    denom = float(phi.T @ (np.asarray(system_matrix, dtype=float) @ phi))
+    numerator = float(np.asarray(rhs, dtype=float).reshape(-1) @ phi)
+    if not np.isfinite(denom) or not np.isfinite(numerator):
+        return float("nan")
+    return float(np.log(denom + eps) - np.log((numerator * numerator) + eps))
+
+
+def _extract_cg_history(
+    seed: int,
+    cg_model: ConjugateGradientMAPBayesianRegression,
+) -> tuple[List[Dict[str, Any]], Dict[str, List[float]]]:
+    rows: List[Dict[str, Any]] = []
+    objective_history: List[float] = []
+    relative_residual_history: List[float] = []
+    residual_norm_history: List[float] = []
+    alpha_history: List[float] = []
+    beta_history: List[float] = []
+
+    weight_history = cg_model.get_weight_history()
+    system_matrix = np.asarray(cg_model.system_matrix_, dtype=float)
+    rhs = np.asarray(cg_model.rhs_, dtype=float).reshape(-1)
+
+    for idx, snapshot in enumerate(cg_model.history_):
+        weights = np.asarray(weight_history[idx], dtype=float).reshape(-1)
+        objective_value = _reduced_objective_from_weights(system_matrix, rhs, weights)
+        objective_history.append(float(objective_value))
+        relative_residual_history.append(float(snapshot.relative_residual))
+        residual_norm_history.append(float(snapshot.residual_norm))
+        alpha_history.append(float(snapshot.alpha))
+        beta_history.append(float(snapshot.beta))
+        rows.append(
+            {
+                "seed": int(seed),
+                "iteration": int(snapshot.iteration),
+                "reduced_objective": float(objective_value),
+                "relative_residual": float(snapshot.relative_residual),
+                "residual_norm": float(snapshot.residual_norm),
+                "alpha": float(snapshot.alpha),
+                "beta": float(snapshot.beta),
+            }
+        )
+
+    return rows, {
+        "objective_history": objective_history,
+        "relative_residual_history": relative_residual_history,
+        "residual_norm_history": residual_norm_history,
+        "alpha_history": alpha_history,
+        "beta_history": beta_history,
+    }
+
+
+def _aggregate_cg_results(per_seed_results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    aggregate: Dict[str, Any] = {
+        "cg": {},
+        "runtime_seconds": {},
+        "iterations": {},
+    }
+
+    for metric_key in CG_METRIC_KEYS:
+        values = [
+            float(seed_result["methods"]["cg"].get(metric_key, np.nan))
+            for seed_result in per_seed_results
+        ]
+        aggregate["cg"][metric_key] = _mean_std(values)
+
+    for runtime_key in ("cg_fit", "total"):
+        values = [
+            float(seed_result["runtime_seconds"].get(runtime_key, np.nan))
+            for seed_result in per_seed_results
+        ]
+        aggregate["runtime_seconds"][runtime_key] = _mean_std(values)
+
+    for aggregate_key, metric_key in (
+        ("cg_objective_evaluations", "objective_evaluations"),
+        ("cg_iterations", "cg_iterations"),
+    ):
+        values = [
+            float(seed_result["methods"]["cg"].get(metric_key, np.nan))
+            for seed_result in per_seed_results
+        ]
+        aggregate["iterations"][aggregate_key] = _mean_std(values)
+    return aggregate
+
+
+def _write_cg_training_csv(path: Path, rows: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "seed",
+        "iteration",
+        "reduced_objective",
+        "relative_residual",
+        "residual_norm",
+        "alpha",
+        "beta",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _write_cg_per_seed_metrics_csv(path: Path, per_seed_results: Sequence[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "seed",
+        "method",
+        "cosine_similarity",
+        "feature_cosine_similarity",
+        "state_overlap_abs",
+        "train_mse",
+        "test_mse",
+        "train_rmse",
+        "test_rmse",
+        "train_r2",
+        "test_r2",
+        "relative_residual",
+        "final_objective",
+        "objective_evaluations",
+        "cg_iterations",
+        "runtime_seconds_method",
+        "runtime_seconds_seed_total",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for seed_result in per_seed_results:
+            metrics = dict(seed_result["methods"]["cg"])
+            runtime = dict(seed_result["runtime_seconds"])
+            writer.writerow(
+                {
+                    "seed": int(seed_result["seed"]),
+                    "method": "cg",
+                    "cosine_similarity": float(metrics.get("cosine_similarity", np.nan)),
+                    "feature_cosine_similarity": float(
+                        metrics.get("feature_cosine_similarity", np.nan)
+                    ),
+                    "state_overlap_abs": float(metrics.get("state_overlap_abs", np.nan)),
+                    "train_mse": float(metrics.get("train_mse", np.nan)),
+                    "test_mse": float(metrics.get("test_mse", np.nan)),
+                    "train_rmse": float(metrics.get("train_rmse", np.nan)),
+                    "test_rmse": float(metrics.get("test_rmse", np.nan)),
+                    "train_r2": float(metrics.get("train_r2", np.nan)),
+                    "test_r2": float(metrics.get("test_r2", np.nan)),
+                    "relative_residual": float(metrics.get("relative_residual", np.nan)),
+                    "final_objective": float(metrics.get("final_objective", np.nan)),
+                    "objective_evaluations": float(metrics.get("objective_evaluations", np.nan)),
+                    "cg_iterations": float(metrics.get("cg_iterations", np.nan)),
+                    "runtime_seconds_method": float(runtime.get("cg_fit", np.nan)),
+                    "runtime_seconds_seed_total": float(runtime.get("total", np.nan)),
+                }
+            )
+
+
+def _write_cg_summary_csv(path: Path, aggregate: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["category", "method", "metric", "mean", "std", "n_valid"]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for metric, stats in aggregate["cg"].items():
+            writer.writerow(
+                {
+                    "category": "method_metric",
+                    "method": "cg",
+                    "metric": metric,
+                    "mean": float(stats.get("mean", np.nan)),
+                    "std": float(stats.get("std", np.nan)),
+                    "n_valid": int(stats.get("n_valid", 0.0)),
+                }
+            )
+        for metric, stats in aggregate["runtime_seconds"].items():
+            writer.writerow(
+                {
+                    "category": "runtime_seconds",
+                    "method": "runtime",
+                    "metric": metric,
+                    "mean": float(stats.get("mean", np.nan)),
+                    "std": float(stats.get("std", np.nan)),
+                    "n_valid": int(stats.get("n_valid", 0.0)),
+                }
+            )
+        for metric, stats in aggregate["iterations"].items():
+            writer.writerow(
+                {
+                    "category": "iterations",
+                    "method": "cg",
+                    "metric": metric,
+                    "mean": float(stats.get("mean", np.nan)),
+                    "std": float(stats.get("std", np.nan)),
+                    "n_valid": int(stats.get("n_valid", 0.0)),
+                }
+            )
+
+
 def _save_seed_artifacts(
     *,
     seed_artifact_path: Path,
@@ -1802,6 +2157,311 @@ def run_experiment(args: argparse.Namespace) -> Dict[str, Any]:
     return payload
 
 
+def run_cg_from_existing_results(args: argparse.Namespace) -> Dict[str, Any]:
+    source_results_path = Path(str(args.cg_only_from_results_path)).expanduser().resolve()
+    if not source_results_path.exists():
+        raise FileNotFoundError(f"Source results JSON not found: {source_results_path}")
+
+    with source_results_path.open("r", encoding="utf-8") as f:
+        source_payload = json.load(f)
+
+    run_paths = _resolve_cg_run_paths(
+        args=args,
+        source_results_path=source_results_path,
+        source_payload=source_payload,
+    )
+    source_config = source_payload.get("config", {})
+    source_dataset = source_payload.get("dataset", {})
+    source_vqbr_config = source_config.get("vqbr", {}) if isinstance(source_config, dict) else {}
+    source_seed_results = {
+        int(seed_result.get("seed")): seed_result
+        for seed_result in source_payload.get("per_seed", [])
+        if isinstance(seed_result, dict) and "seed" in seed_result
+    }
+    source_seed_artifact_files = _resolve_source_seed_artifact_files(source_payload, source_results_path)
+    if not source_seed_artifact_files:
+        raise ValueError(
+            "No source seed artifacts were found. "
+            "Expected seed_artifact_files in the source results payload or a seed_artifacts/ directory."
+        )
+
+    cg_maxiter_default = source_vqbr_config.get("maxiter", args.vqbr_maxiter)
+    cg_maxiter = int(args.cg_maxiter) if args.cg_maxiter is not None else int(cg_maxiter_default)
+    if cg_maxiter <= 0:
+        raise ValueError("--cg-maxiter must be positive.")
+    cg_preconditioner = str(args.cg_preconditioner).strip().lower()
+    if cg_preconditioner not in {"none", "jacobi"}:
+        raise ValueError("--cg-preconditioner must be either 'none' or 'jacobi'.")
+
+    seeds = list(source_config.get("seeds", []))
+    if not seeds:
+        seeds = sorted(
+            int(np.asarray(load_seed_artifacts(path)["seed"]).reshape(-1)[0])
+            for path in source_seed_artifact_files
+        )
+
+    print("=== Energy CG Baseline (artifact reuse) ===")
+    print(f"Source results: {source_results_path}")
+    print(f"Source run directory: {source_payload.get('run_dir', source_results_path.parent)}")
+    print(f"Dataset: {source_dataset.get('path', '')}")
+    print(f"Sheet: {source_dataset.get('sheet_name', '')}")
+    print(f"Target: {source_dataset.get('target_col', '')}")
+    print(
+        f"Shape (used): N={int(source_dataset.get('n_samples', 0))}, "
+        f"D={int(source_dataset.get('n_features', 0))}"
+    )
+    print(
+        "Split ratios: "
+        f"prior={float(source_config.get('split_ratios', {}).get('prior', np.nan)):.3f}, "
+        f"train={float(source_config.get('split_ratios', {}).get('train', np.nan)):.3f}, "
+        f"test={float(source_config.get('split_ratios', {}).get('test', np.nan)):.3f}"
+    )
+    print(f"Seeds ({len(seeds)}): {', '.join(str(int(seed)) for seed in seeds)}")
+    print(
+        f"CG config: maxiter={cg_maxiter}, preconditioner={cg_preconditioner}, "
+        "initial_point=zeros"
+    )
+    print(f"Reduced objective formula: {LOG_RATIO_LOSS_FORMULA}")
+    print(f"Run directory: {run_paths['run_dir']}")
+
+    training_rows: List[Dict[str, Any]] = []
+    per_seed_results: List[Dict[str, Any]] = []
+    experiment_start = time.perf_counter()
+
+    for seed_idx, seed_artifact_path in enumerate(source_seed_artifact_files, start=1):
+        artifacts = load_seed_artifacts(seed_artifact_path)
+        seed = int(np.asarray(artifacts["seed"]).reshape(-1)[0])
+        print("")
+        print(f"[seed={seed}] ({seed_idx}/{len(source_seed_artifact_files)})", flush=True)
+        seed_start = time.perf_counter()
+
+        X_train = np.asarray(artifacts["X_train_standardized"], dtype=float)
+        y_train_std_values = np.asarray(artifacts["y_train_standardized"], dtype=float).reshape(-1)
+        X_test = np.asarray(artifacts["X_test_standardized"], dtype=float)
+        y_train_raw = np.asarray(artifacts["y_train_raw"], dtype=float).reshape(-1)
+        y_test_raw = np.asarray(artifacts["y_test_raw"], dtype=float).reshape(-1)
+        y_train_mean = float(np.asarray(artifacts["y_train_mean"], dtype=float).reshape(-1)[0])
+        y_train_std = float(np.asarray(artifacts["y_train_std"], dtype=float).reshape(-1)[0])
+        m0 = np.asarray(artifacts["m0"], dtype=float).reshape(-1)
+        Sigma0 = np.asarray(artifacts["Sigma0"], dtype=float)
+        V = float(np.asarray(artifacts["V"], dtype=float).reshape(-1)[0])
+        w_closed = np.asarray(artifacts["w_closed"], dtype=float).reshape(-1)
+
+        cg_model = ConjugateGradientMAPBayesianRegression(
+            maxiter=int(cg_maxiter),
+            preconditioner=str(cg_preconditioner),
+        )
+        cg_start = time.perf_counter()
+        cg_state = np.asarray(
+            cg_model.fit(X_train, y_train_std_values, m0, Sigma0, V),
+            dtype=complex,
+        ).reshape(-1)
+        cg_runtime = float(time.perf_counter() - cg_start)
+        cg_state = _normalize_state(cg_state)
+
+        history_rows, history_series = _extract_cg_history(int(seed), cg_model)
+        training_rows.extend(history_rows)
+
+        w_cg = np.asarray(cg_model.get_weights(), dtype=float).reshape(-1)
+        cg_regression_metrics = _evaluate_regression_metrics(
+            X_train_standardized=X_train,
+            y_train_raw=y_train_raw,
+            X_test_standardized=X_test,
+            y_test_raw=y_test_raw,
+            w_standardized=w_cg,
+            y_train_mean=y_train_mean,
+            y_train_std=y_train_std,
+        )
+
+        feature_cosine_similarity = _safe_cosine(w_cg, w_closed)
+        cosine_similarity = float(feature_cosine_similarity)
+        state_overlap_abs = float(
+            np.abs(
+                np.vdot(
+                    _normalized_closed_form_state(w_closed),
+                    _normalized_closed_form_state(w_cg),
+                )
+            )
+        )
+        objective_history = history_series["objective_history"]
+        finite_objectives = [x for x in objective_history if np.isfinite(x)]
+        final_objective = float(finite_objectives[-1]) if finite_objectives else float("nan")
+        relative_residual = float(cg_model.get_relative_residual())
+
+        cg_metrics = {
+            "cosine_similarity": float(cosine_similarity),
+            "feature_cosine_similarity": float(feature_cosine_similarity),
+            "state_overlap_abs": float(state_overlap_abs),
+            "train_mse": float(cg_regression_metrics["train_mse"]),
+            "test_mse": float(cg_regression_metrics["test_mse"]),
+            "train_rmse": float(cg_regression_metrics["train_rmse"]),
+            "test_rmse": float(cg_regression_metrics["test_rmse"]),
+            "train_r2": float(cg_regression_metrics["train_r2"]),
+            "test_r2": float(cg_regression_metrics["test_r2"]),
+            "relative_residual": float(relative_residual),
+            "final_objective": float(final_objective),
+            "objective_evaluations": int(len(objective_history)),
+            "cg_iterations": int(len(objective_history)),
+            "preconditioner": str(cg_preconditioner),
+            "objective_history": [float(x) for x in objective_history],
+            "relative_residual_history": [
+                float(x) for x in history_series["relative_residual_history"]
+            ],
+            "residual_norm_history": [float(x) for x in history_series["residual_norm_history"]],
+            "alpha_history": [float(x) for x in history_series["alpha_history"]],
+            "beta_history": [float(x) for x in history_series["beta_history"]],
+        }
+
+        print(
+            "  cg: "
+            f"cos={cg_metrics['cosine_similarity']:.6f}, "
+            f"train_rmse={cg_metrics['train_rmse']:.6e}, "
+            f"test_rmse={cg_metrics['test_rmse']:.6e}, "
+            f"train_R2={cg_metrics['train_r2']:.6f}, "
+            f"test_R2={cg_metrics['test_r2']:.6f}, "
+            f"rel_res={cg_metrics['relative_residual']:.6e}, "
+            f"final_obj={cg_metrics['final_objective']:.6e}"
+        )
+
+        seed_runtime = float(time.perf_counter() - seed_start)
+        runtime_info = {
+            "cg_fit": float(cg_runtime),
+            "total": float(seed_runtime),
+        }
+        print(
+            "  runtime (s): "
+            f"cg_fit={runtime_info['cg_fit']:.3f}, "
+            f"total={runtime_info['total']:.3f}"
+        )
+
+        source_seed_result = dict(source_seed_results.get(int(seed), {}))
+        per_seed_results.append(
+            {
+                "seed": int(seed),
+                "dataset": dict(source_seed_result.get("dataset", {})),
+                "split_sizes": dict(source_seed_result.get("split_sizes", {})),
+                "preprocessing": dict(source_seed_result.get("preprocessing", {})),
+                "prior_estimate": dict(source_seed_result.get("prior_estimate", {})),
+                "runtime_seconds": runtime_info,
+                "artifacts": {
+                    "source_seed_npz_path": str(Path(seed_artifact_path).expanduser().resolve()),
+                },
+                "methods": {
+                    "cg": cg_metrics,
+                },
+            }
+        )
+
+    aggregate = _aggregate_cg_results(per_seed_results)
+    total_runtime = float(time.perf_counter() - experiment_start)
+
+    print("")
+    print("=== Aggregate Results (mean +/- std over seeds) ===")
+    print(f"CG state cosine:        {_format_mean_std(aggregate['cg']['cosine_similarity'], scientific=False)}")
+    print(f"CG train RMSE:          {_format_mean_std(aggregate['cg']['train_rmse'], scientific=True)}")
+    print(f"CG test RMSE:           {_format_mean_std(aggregate['cg']['test_rmse'], scientific=True)}")
+    print(f"CG train R^2:           {_format_mean_std(aggregate['cg']['train_r2'], scientific=False)}")
+    print(f"CG test R^2:            {_format_mean_std(aggregate['cg']['test_r2'], scientific=False)}")
+    print(
+        "CG relative residual:   "
+        f"{_format_mean_std(aggregate['cg']['relative_residual'], scientific=True)}"
+    )
+    print(
+        "CG final reduced obj:   "
+        f"{_format_mean_std(aggregate['cg']['final_objective'], scientific=True)}"
+    )
+    print(
+        "CG fit runtime (s):     "
+        f"{_format_mean_std(aggregate['runtime_seconds']['cg_fit'], scientific=True)}"
+    )
+    print(f"Total wall-clock runtime: {total_runtime:.3f} s")
+
+    output_path = Path(args.output_path).expanduser().resolve()
+    training_csv_path = Path(args.training_csv_path).expanduser().resolve()
+    per_seed_csv_path = Path(args.per_seed_csv_path).expanduser().resolve()
+    summary_csv_path = Path(args.summary_csv_path).expanduser().resolve()
+    run_config_path = Path(args.run_config_path).expanduser().resolve()
+
+    _write_cg_training_csv(training_csv_path, training_rows)
+    _write_cg_per_seed_metrics_csv(per_seed_csv_path, per_seed_results)
+    _write_cg_summary_csv(summary_csv_path, aggregate)
+
+    payload: Dict[str, Any] = {
+        "run_utc": datetime.now(timezone.utc).isoformat(),
+        "run_tag": str(getattr(args, "resolved_run_tag", "")),
+        "run_dir": str(getattr(args, "resolved_run_dir", "")),
+        "source_run": {
+            "results_path": str(source_results_path),
+            "run_tag": str(source_payload.get("run_tag", "")),
+            "run_dir": str(source_payload.get("run_dir", source_results_path.parent)),
+        },
+        "dataset": dict(source_dataset),
+        "config": {
+            "split_ratios": dict(source_config.get("split_ratios", {})),
+            "seeds": [int(seed) for seed in seeds],
+            "num_seeds": int(len(seeds)),
+            "seed_mode": "artifact_reuse",
+            "prior_estimation": dict(source_config.get("prior_estimation", {})),
+            "source_vqbr": dict(source_vqbr_config),
+            "preprocessing": dict(source_config.get("preprocessing", {})),
+            "dataset_subsampling": dict(source_config.get("dataset_subsampling", {})),
+            "cg": {
+                "maxiter": int(cg_maxiter),
+                "preconditioner": str(cg_preconditioner),
+                "initial_point": "zeros",
+                "objective_formula": LOG_RATIO_LOSS_FORMULA,
+            },
+        },
+        "split_sizes": dict(source_payload.get("split_sizes", {})),
+        "per_seed": per_seed_results,
+        "aggregate": aggregate,
+        "runtime_seconds_total": float(total_runtime),
+        "artifacts": {
+            "run_dir": str(getattr(args, "resolved_run_dir", "")),
+            "run_config_path": str(run_config_path),
+            "training_csv_path": str(training_csv_path),
+            "per_seed_csv_path": str(per_seed_csv_path),
+            "summary_csv_path": str(summary_csv_path),
+            "source_results_path": str(source_results_path),
+            "source_seed_artifact_files": [str(Path(path).expanduser().resolve()) for path in source_seed_artifact_files],
+        },
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=int(args.json_indent))
+
+    run_config_payload: Dict[str, Any] = {
+        "saved_utc": datetime.now(timezone.utc).isoformat(),
+        "command": " ".join(shlex.quote(token) for token in sys.argv),
+        "args": dict(vars(args)),
+        "resolved": {
+            "source_results_path": str(source_results_path),
+            "seeds": [int(seed) for seed in seeds],
+            "num_seeds": int(len(seeds)),
+            "cg": payload["config"]["cg"],
+            "outputs": {
+                "results_json": str(output_path),
+                "run_config_json": str(run_config_path),
+                "training_csv": str(training_csv_path),
+                "per_seed_csv": str(per_seed_csv_path),
+                "summary_csv": str(summary_csv_path),
+                "console_log": str(args.console_log_path).strip(),
+            },
+        },
+    }
+    run_config_path.parent.mkdir(parents=True, exist_ok=True)
+    with run_config_path.open("w", encoding="utf-8") as f:
+        json.dump(run_config_payload, f, indent=int(args.json_indent))
+
+    print(f"Saved CG JSON results to:  {output_path}")
+    print(f"Saved CG run config JSON: {run_config_path}")
+    print(f"Saved CG training CSV:    {training_csv_path}")
+    print(f"Saved CG per-seed CSV:    {per_seed_csv_path}")
+    print(f"Saved CG summary CSV:     {summary_csv_path}")
+    return payload
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -1880,6 +2540,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vqbr-shots", type=int, default=2048)
     parser.add_argument("--vqbr-loss", type=str, default="log_ratio")
     parser.add_argument("--vqbr-verbose", action="store_true")
+    parser.add_argument(
+        "--cg-only-from-results-path",
+        type=str,
+        default="",
+        help=(
+            "Optional existing energy results.json path. When provided, the script "
+            "reuses that run's saved seed artifacts and computes only the CG baseline."
+        ),
+    )
+    parser.add_argument(
+        "--cg-maxiter",
+        type=int,
+        default=None,
+        help=(
+            "Iteration budget for the reused CG baseline. "
+            "Default matches the source run's VQBR maxiter."
+        ),
+    )
+    parser.add_argument(
+        "--cg-preconditioner",
+        type=str,
+        default=DEFAULT_CG_PRECONDITIONER,
+        choices=("none", "jacobi"),
+        help="Preconditioner used by the reused CG baseline.",
+    )
 
     parser.set_defaults(vqbr_use_shot_noise=False)
     parser.add_argument("--vqbr-use-shot-noise", dest="vqbr_use_shot_noise", action="store_true")
@@ -1973,22 +2658,38 @@ class _TeeStream:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-    seeds = _resolve_seeds(
-        num_seeds=int(args.num_seeds),
-        seed_offset=int(args.seed_offset),
-        explicit_seeds=args.seeds,
-    )
-    _resolve_run_paths(
-        args=args,
-        seeds=seeds,
-        optimizer=ENFORCED_VQBR_OPTIMIZER,
-        loss=ENFORCED_VQBR_LOSS,
-        use_shot_noise=bool(args.vqbr_use_shot_noise),
-        su2_gates=ENFORCED_VQBR_SU2_GATES,
-    )
+    cg_only_results_raw = str(args.cg_only_from_results_path).strip()
+    if cg_only_results_raw:
+        source_results_path = Path(cg_only_results_raw).expanduser().resolve()
+        if not source_results_path.exists():
+            raise FileNotFoundError(f"Source results JSON not found: {source_results_path}")
+        with source_results_path.open("r", encoding="utf-8") as f:
+            source_payload = json.load(f)
+        _resolve_cg_run_paths(
+            args=args,
+            source_results_path=source_results_path,
+            source_payload=source_payload,
+        )
+    else:
+        seeds = _resolve_seeds(
+            num_seeds=int(args.num_seeds),
+            seed_offset=int(args.seed_offset),
+            explicit_seeds=args.seeds,
+        )
+        _resolve_run_paths(
+            args=args,
+            seeds=seeds,
+            optimizer=ENFORCED_VQBR_OPTIMIZER,
+            loss=ENFORCED_VQBR_LOSS,
+            use_shot_noise=bool(args.vqbr_use_shot_noise),
+            su2_gates=ENFORCED_VQBR_SU2_GATES,
+        )
     console_log_raw = str(args.console_log_path).strip()
     if not console_log_raw:
-        run_experiment(args)
+        if cg_only_results_raw:
+            run_cg_from_existing_results(args)
+        else:
+            run_experiment(args)
         return
 
     console_log_path = Path(console_log_raw).expanduser().resolve()
@@ -1998,7 +2699,10 @@ def main() -> None:
         tee_stderr = _TeeStream(sys.__stderr__, log_file)
         with redirect_stdout(tee_stdout), redirect_stderr(tee_stderr):
             print(f"Console log file: {console_log_path}")
-            run_experiment(args)
+            if cg_only_results_raw:
+                run_cg_from_existing_results(args)
+            else:
+                run_experiment(args)
 
 
 if __name__ == "__main__":

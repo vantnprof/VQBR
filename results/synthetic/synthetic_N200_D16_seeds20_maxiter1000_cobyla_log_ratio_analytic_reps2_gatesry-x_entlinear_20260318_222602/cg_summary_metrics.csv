@@ -1,0 +1,14 @@
+category,method,metric,mean,std,n_valid
+method_metric,cg,cosine_similarity,1.0,1.7728839976828627e-16,20
+method_metric,cg,feature_cosine_similarity,1.0,1.7728839976828627e-16,20
+method_metric,cg,state_overlap_abs,1.0,1.1102230246251565e-16,20
+method_metric,cg,train_rmse,0.09285714585838627,0.0062298204902379445,20
+method_metric,cg,test_rmse,0.10358975556250523,0.010444312177635582,20
+method_metric,cg,train_r2,0.9993170412698207,0.000243584454061075,20
+method_metric,cg,test_r2,0.9991894374907823,0.0003025071625448474,20
+method_metric,cg,relative_residual,7.041643417123172e-10,4.3712488357919046e-10,20
+method_metric,cg,final_objective,-7.44983717894925,0.3344342780867074,20
+runtime_seconds,runtime,cg_fit,0.00231520589441061,6.720905356683239e-05,20
+runtime_seconds,runtime,total,0.02422125181183219,0.003773246998795127,20
+iterations,cg,cg_objective_evaluations,1000.0,0.0,20
+iterations,cg,cg_iterations,1000.0,0.0,20

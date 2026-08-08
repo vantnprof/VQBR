@@ -52,6 +52,7 @@ class ConjugateGradientMAPBayesianRegression:
 
         self.history_: list[CGSnapshot] = []
         self.residual_history_: Optional[np.ndarray] = None
+        self.weight_history_: Optional[np.ndarray] = None
         self.result_: Optional[np.ndarray] = None
         self.map_weights_: Optional[np.ndarray] = None
         self.trained_state_: Optional[np.ndarray] = None
@@ -92,12 +93,13 @@ class ConjugateGradientMAPBayesianRegression:
         b = X.T @ y + V * (precision @ m0)
 
         w0 = self._make_initial_point(n_features)
-        w_map, history = self._run_cg(A, b, w0)
+        w_map, history, weight_history = self._run_cg(A, b, w0)
 
         state = self._weights_to_state(w_map)
 
         self.history_ = history
         self.residual_history_ = np.array([snap.relative_residual for snap in history], dtype=float)
+        self.weight_history_ = np.asarray(weight_history, dtype=float)
         self.result_ = w_map.copy()
         self.map_weights_ = w_map.copy()
         self.trained_state_ = state
@@ -122,6 +124,11 @@ class ConjugateGradientMAPBayesianRegression:
         if self.relative_residual_ is None:
             raise RuntimeError("Model is not fitted yet.")
         return float(self.relative_residual_)
+
+    def get_weight_history(self) -> np.ndarray:
+        if self.weight_history_ is None:
+            raise RuntimeError("Model is not fitted yet.")
+        return self.weight_history_.copy()
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         w = self.get_weights()
@@ -218,9 +225,11 @@ class ConjugateGradientMAPBayesianRegression:
     def _append_idle_history(
         self,
         history: list[CGSnapshot],
+        weight_history: list[np.ndarray],
         start_iteration: int,
         residual_norm: float,
         relative_residual: float,
+        w: np.ndarray,
     ) -> None:
         for it in range(start_iteration, self.maxiter + 1):
             history.append(
@@ -232,13 +241,14 @@ class ConjugateGradientMAPBayesianRegression:
                     beta=0.0,
                 )
             )
+            weight_history.append(np.asarray(w, dtype=float).copy())
 
     def _run_cg(
         self,
         A: np.ndarray,
         b: np.ndarray,
         w0: np.ndarray,
-    ) -> tuple[np.ndarray, list[CGSnapshot]]:
+    ) -> tuple[np.ndarray, list[CGSnapshot], np.ndarray]:
         w = w0.copy()
         r = b - A @ w
         b_norm = float(np.linalg.norm(b))
@@ -252,19 +262,20 @@ class ConjugateGradientMAPBayesianRegression:
         p = z.copy()
         rz_old = float(np.dot(r, z))
         history: list[CGSnapshot] = []
+        weight_history: list[np.ndarray] = []
 
         rel_res, r_norm = self._relative_residual(r, b_norm)
         if r_norm <= self.eps:
-            self._append_idle_history(history, 1, r_norm, rel_res)
-            return w, history
+            self._append_idle_history(history, weight_history, 1, r_norm, rel_res, w)
+            return w, history, np.asarray(weight_history, dtype=float)
 
         for it in range(1, self.maxiter + 1):
             Ap = A @ p
             pAp = float(np.dot(p, Ap))
 
             if abs(pAp) <= self.eps:
-                self._append_idle_history(history, it, r_norm, rel_res)
-                return w, history
+                self._append_idle_history(history, weight_history, it, r_norm, rel_res, w)
+                return w, history, np.asarray(weight_history, dtype=float)
 
             alpha = rz_old / pAp
             w = w + alpha * p
@@ -290,15 +301,16 @@ class ConjugateGradientMAPBayesianRegression:
                     beta=float(beta),
                 )
             )
+            weight_history.append(w.copy())
 
             if r_norm <= self.eps or abs(rz_new) <= self.eps:
-                self._append_idle_history(history, it + 1, r_norm, rel_res)
-                return w, history
+                self._append_idle_history(history, weight_history, it + 1, r_norm, rel_res, w)
+                return w, history, np.asarray(weight_history, dtype=float)
 
             p = z + beta * p
             rz_old = rz_new
 
-        return w, history
+        return w, history, np.asarray(weight_history, dtype=float)
 
     @staticmethod
     def _pad_to_pow2(vec: np.ndarray) -> np.ndarray:

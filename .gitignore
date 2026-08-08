@@ -209,3 +209,4 @@ data/real/**/*.txt
 data/real/**/*.csv
 data/real/**/*.xlsx
 data/real/**/*.zip
+config/

@@ -69,6 +69,8 @@ def test_fit_matches_direct_map_solution_full_covariance() -> None:
     assert len(model.history_) == maxiter
     assert model.residual_history_ is not None
     assert model.residual_history_.shape == (maxiter,)
+    weight_history = model.get_weight_history()
+    assert weight_history.shape == (maxiter, X.shape[1])
 
     manual_rel = np.linalg.norm(A @ model.get_weights() - b) / np.linalg.norm(b)
     assert np.isclose(model.get_relative_residual(), manual_rel, rtol=1e-10, atol=1e-12)
@@ -167,6 +169,8 @@ def test_unfitted_methods_raise() -> None:
         model.get_weights()
     with pytest.raises(RuntimeError, match="Model is not fitted yet"):
         model.get_relative_residual()
+    with pytest.raises(RuntimeError, match="Model is not fitted yet"):
+        model.get_weight_history()
     with pytest.raises(RuntimeError, match="Model is not fitted yet"):
         model.predict(np.zeros((2, 2)))
 
