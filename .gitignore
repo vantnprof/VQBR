@@ -210,3 +210,9 @@ data/real/**/*.csv
 data/real/**/*.xlsx
 data/real/**/*.zip
 config/
+
+# Local experiment outputs; keep the archived results/ available for comparison.
+/runs/
+.env.*
+!.env.example
+.DS_Store

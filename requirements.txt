@@ -1,0 +1,9 @@
+# Validated with Python 3.11; these are direct dependencies, not a full lockfile.
+numpy==2.2.6
+scipy==1.15.3
+qiskit==2.3.0
+qiskit-aer==0.17.2
+matplotlib==3.10.3
+openpyxl==3.1.5
+pytest==8.4.2
+qiskit-ibm-runtime==0.43.1

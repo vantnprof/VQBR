@@ -2125,7 +2125,7 @@ def run_cg_from_existing_results(args: argparse.Namespace) -> Dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Synthetic VQBR experiment (N=200, D=32 by default) with prior/train/test split 0.2/0.6/0.2. "
+            "Synthetic VQBR experiment (N=200, D=16 by default) with prior/train/test split 0.2/0.6/0.2. "
             "Runs closed-form MAP and VQBR over multiple seeds and stores full VQBR training logs."
         )
     )
